@@ -1,11 +1,17 @@
 // Reddit module
-// Routes through Cloudflare Worker proxy using RSS feeds for subreddit posts
-// Uses .json endpoints for individual post comments (via same proxy)
-// Deep links to Reddit app for posting
+// Fetches Reddit's public .json endpoints directly from the device (residential
+// IP), which Reddit tolerates at low volume where datacenter IPs get blocked.
+// Deep links to Reddit app for posting.
 
 import store from './store';
 
-var PROXY_BASE = 'https://reddit-proxy.brandonleesheffield.workers.dev/';
+var REDDIT_BASE = 'https://www.reddit.com';
+// Reddit 403s blank/unrecognized clients on the public .json endpoints. Since
+// the request really does come from an iPhone, send a genuine mobile-Safari
+// User-Agent — Reddit is far more permissive toward browser-shaped requests.
+var USER_AGENT =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) ' +
+  'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
 // ── Username ──
 let username = '';
@@ -24,28 +30,70 @@ export function getUsername() {
   return username;
 }
 
-// ── Proxy fetch helper ──
-async function proxyFetch(params) {
-  var query = Object.keys(params).map(function (k) {
-    return k + '=' + encodeURIComponent(params[k]);
-  }).join('&');
-  var url = PROXY_BASE + '?' + query;
-  console.log('[Rengage] Fetching:', url);
-  var res;
-  try {
-    res = await fetch(url);
-  } catch (e) {
-    throw new Error('Network error: ' + e.message);
-  }
-  if (!res.ok) {
-    var errText = '';
-    try { errText = await res.text(); } catch (e2) {}
-    throw new Error('Proxy ' + res.status + ': ' + errText.slice(0, 150));
-  }
-  return res;
+// ── Reddit fetch helper ──
+function delay(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
 }
 
-// ── Parse RSS XML into post objects (no DOMParser in React Native) ──
+// Core fetch with retry/backoff. Returns the raw body text and throws
+// *diagnostic* errors so we can tell the failure modes apart:
+//   "Reddit 429"           -> rate-limited (back off / slow down)
+//   "Blocked by Reddit"     -> 403/HTML block page (Reddit refuses the client)
+//   "Reddit 4xx/5xx"        -> other upstream error
+async function redditFetchRaw(path) {
+  var url = REDDIT_BASE + path;
+  console.log('[Rengage] Fetching:', url);
+
+  var maxAttempts = 4;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    var res;
+    try {
+      res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+    } catch (e) {
+      if (attempt < maxAttempts) {
+        await delay(600 * attempt);
+        continue;
+      }
+      throw new Error('Network error: ' + e.message);
+    }
+
+    // Rate-limited / temporarily unavailable: back off and retry.
+    if ((res.status === 429 || res.status === 503) && attempt < maxAttempts) {
+      var retryAfter = parseInt(res.headers.get('retry-after'), 10);
+      var waitMs = retryAfter > 0 ? retryAfter * 1000 : 1000 * Math.pow(2, attempt - 1);
+      console.warn('[Rengage] ' + res.status + ' on attempt ' + attempt + ', retrying in ' + waitMs + 'ms');
+      await delay(waitMs);
+      continue;
+    }
+
+    var body = await res.text();
+
+    if (!res.ok) {
+      throw new Error('Reddit ' + res.status + ': ' + body.slice(0, 120));
+    }
+
+    // Soft-block detection: when Reddit blocks, it serves its web page
+    // (class=theme-beta) or a generic HTML doc instead of the feed/JSON.
+    var head = body.replace(/^﻿/, '').replace(/^\s+/, '').slice(0, 200).toLowerCase();
+    if (head.indexOf('theme-beta') !== -1 || head.indexOf('<!doctype html') !== -1 || head.indexOf('<html') === 0) {
+      throw new Error('Blocked by Reddit (HTML block page)');
+    }
+
+    return body;
+  }
+  throw new Error('Reddit rate-limited after ' + maxAttempts + ' attempts');
+}
+
+async function redditFetchJson(path) {
+  var body = await redditFetchRaw(path);
+  var trimmed = body.replace(/^﻿/, '').replace(/^\s+/, '');
+  if (trimmed.charAt(0) !== '{' && trimmed.charAt(0) !== '[') {
+    throw new Error('Non-JSON response — starts: ' + trimmed.slice(0, 60));
+  }
+  return JSON.parse(trimmed);
+}
+
+// ── Parse Reddit Atom/RSS XML into post objects (no DOMParser in RN) ──
 function getTag(xml, tag) {
   var re = new RegExp('<' + tag + '[^>]*>([\\s\\S]*?)<\\/' + tag + '>', 'i');
   var m = xml.match(re);
@@ -60,45 +108,25 @@ function getAttr(xml, tag, attr) {
 
 function parseRSS(xmlText) {
   var posts = [];
-
-  // Split on <entry> tags
   var parts = xmlText.split(/<entry>/i);
-  // First part is the feed header, skip it
   for (var i = 1; i < parts.length; i++) {
     var chunk = parts[i].split(/<\/entry>/i)[0];
 
     var title = getTag(chunk, 'title');
-    // Decode HTML entities
     title = title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 
-    var author = getTag(chunk, 'name');
-    author = author.replace(/^\/u\//, '');
-
+    var author = getTag(chunk, 'name').replace(/^\/u\//, '');
     var link = getAttr(chunk, 'link', 'href');
-
     var updated = getTag(chunk, 'updated');
 
     var content = getTag(chunk, 'content');
-    // Decode HTML entities in content then strip tags
     content = content.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
     var selftext = content.replace(/<[^>]*>/g, '').trim().slice(0, 500);
 
-    // Parse permalink from URL
-    var permalink = '';
-    try {
-      permalink = link.replace('https://www.reddit.com', '');
-    } catch (e) {
-      permalink = link;
-    }
-
-    // Extract post ID
+    var permalink = link.replace('https://www.reddit.com', '');
     var idMatch = permalink.match(/\/comments\/([a-z0-9]+)/);
     var id = idMatch ? idMatch[1] : 'rss-' + i;
-
-    // Convert ISO timestamp to unix epoch
     var created_utc = updated ? Math.floor(new Date(updated).getTime() / 1000) : 0;
-
-    // Extract subreddit
     var subMatch = permalink.match(/\/r\/([^\/]+)/);
     var subreddit = subMatch ? subMatch[1] : '';
 
@@ -117,31 +145,36 @@ function parseRSS(xmlText) {
       });
     }
   }
-
   return posts;
 }
 
-// ── Fetch subreddit posts via RSS proxy ──
+// ── Fetch subreddit posts via Reddit's RSS feed ──
+// Reddit treats .rss more leniently than .json (it's meant for feed readers),
+// so this is our best shot at unauthenticated access. `sub` is left un-encoded
+// so multi-sub groupings ("a+b+c") keep working.
 export async function fetchSubredditPosts(subreddit) {
   var sub = subreddit.replace(/^r\//i, '').trim();
-  var res = await proxyFetch({ sub: sub });
-  var xmlText = await res.text();
-  return parseRSS(xmlText);
+  var xml = await redditFetchRaw('/r/' + sub + '/new/.rss?limit=25');
+  var posts = parseRSS(xml);
+  console.log('[Rengage] Parsed ' + posts.length + ' posts from r/' + sub);
+  return posts;
 }
 
-// ── Fetch with keyword search via RSS proxy ──
+// ── Fetch with keyword search via Reddit's RSS feed ──
 export async function searchSubredditPosts(subreddit, query) {
   var sub = subreddit.replace(/^r\//i, '').trim();
-  var res = await proxyFetch({ sub: sub, q: query });
-  var xmlText = await res.text();
-  return parseRSS(xmlText);
+  var xml = await redditFetchRaw(
+    '/r/' + sub + '/search.rss?q=' + encodeURIComponent(query) +
+    '&restrict_sr=1&sort=new&limit=25'
+  );
+  return parseRSS(xml);
 }
 
-// ── Fetch post comments via JSON (through proxy) ──
+// ── Fetch post comments (JSON; .rss has no comment trees) ──
+// Note: if Reddit 403s .json this will fail, leaving follow-ups degraded even
+// when the RSS-based scan works. That's an accepted limitation of no-auth access.
 async function jsonFetch(path) {
-  var redditUrl = 'https://www.reddit.com' + path;
-  var res = await proxyFetch({ url: redditUrl });
-  return res.json();
+  return redditFetchJson(path);
 }
 
 export async function fetchPostComments(postId) {
@@ -166,6 +199,52 @@ export function getRedditDeepLink(permalink) {
   return 'https://www.reddit.com' + permalink;
 }
 
+// ── Inbox replies via private RSS feed ──
+// Reddit exposes a token-protected RSS feed of replies/mentions at
+// reddit.com/prefs/feeds ("RSS feed of your private messages"). This uses the
+// RSS path (which works) instead of the blocked .json comment endpoints.
+function parseInboxRSS(xmlText) {
+  var items = [];
+  var parts = xmlText.split(/<entry>/i);
+  for (var i = 1; i < parts.length; i++) {
+    var chunk = parts[i].split(/<\/entry>/i)[0];
+
+    var title = getTag(chunk, 'title')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    var author = getTag(chunk, 'name').replace(/^\/u\//, '');
+    var link = getAttr(chunk, 'link', 'href');
+    var updated = getTag(chunk, 'updated');
+    var content = getTag(chunk, 'content')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+    var body = content.replace(/<[^>]*>/g, '').trim().slice(0, 500);
+    var created_utc = updated ? Math.floor(new Date(updated).getTime() / 1000) : 0;
+    var subMatch = link.match(/\/r\/([^\/]+)/);
+    var subreddit = subMatch ? subMatch[1] : '';
+
+    items.push({
+      author: author,
+      title: title,
+      body: body,
+      link: link,
+      created_utc: created_utc,
+      subreddit: subreddit,
+    });
+  }
+  return items;
+}
+
+// Pass the full feed URL copied from reddit.com/prefs/feeds.
+export async function fetchInboxReplies(inboxUrl) {
+  if (!inboxUrl) return { items: [], error: 'no-url' };
+  var path = inboxUrl.trim().replace(/^https?:\/\/[^/]+/i, '');
+  try {
+    var xml = await redditFetchRaw(path);
+    return { items: parseInboxRSS(xml), error: '' };
+  } catch (e) {
+    return { items: [], error: e.message };
+  }
+}
+
 // ── Follow-up tracking ──
 function flattenComments(children, arr) {
   if (!children) return arr;
@@ -188,7 +267,7 @@ function flattenComments(children, arr) {
 }
 
 export async function checkFollowUps(commentLog, user) {
-  if (!user) return [];
+  if (!user) return { items: [], total: 0, failed: 0, error: '' };
 
   var userLower = user.toLowerCase();
   var entries = Object.keys(commentLog).map(function (url) {
@@ -205,6 +284,8 @@ export async function checkFollowUps(commentLog, user) {
   recent = recent.slice(0, 20);
 
   var followUps = [];
+  var failed = 0;
+  var sampleError = '';
 
   for (var i = 0; i < recent.length; i++) {
     var entry = recent[i];
@@ -257,6 +338,8 @@ export async function checkFollowUps(commentLog, user) {
         await new Promise(function (resolve) { setTimeout(resolve, 300); });
       }
     } catch (e) {
+      failed++;
+      if (!sampleError) sampleError = e.message;
       console.warn('Follow-up check failed for', entry.url, e.message);
     }
   }
@@ -267,7 +350,7 @@ export async function checkFollowUps(commentLog, user) {
     return b.latestReply.created_utc - a.latestReply.created_utc;
   });
 
-  return followUps;
+  return { items: followUps, total: recent.length, failed: failed, error: sampleError };
 }
 
 // ── Posting frequency tracker ──

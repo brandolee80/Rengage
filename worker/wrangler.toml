@@ -1,0 +1,7 @@
+name = "reddit-proxy"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Secrets (do NOT put values here — set them with `wrangler secret put`):
+#   wrangler secret put REDDIT_CLIENT_ID
+#   wrangler secret put REDDIT_CLIENT_SECRET

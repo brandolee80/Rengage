@@ -1,5 +1,10 @@
 // Relevance scoring for Reddit posts against campaign keywords
 
+// Only posts whose local heuristic score clears this bar are sent for AI
+// scoring — saves Gemini quota on posts the heuristic already rates as noise
+// (AI rarely upgrades those). Tune to taste.
+export var AI_SCORE_MIN_LOCAL = 20;
+
 var PAIN_WORDS = [
   'frustrated', 'struggling', 'tired of', 'hate', 'stressed',
   'overwhelmed', 'broke', 'failing', 'give up', "doesn't work",

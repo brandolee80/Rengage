@@ -7,10 +7,72 @@ import store from './store';
 let apiKey = null;
 let usageLog = { totalPromptTokens: 0, totalResponseTokens: 0, calls: 0, history: [] };
 
+// ── Model + quota governor ──
+// All configurable in Settings. Free-tier limits are small and vary by model:
+//   2.5 Flash / 3 Flash: 5 RPM, 20 RPD   |   2.5 Flash Lite: 10 RPM, 20 RPD
+//   3.1 Flash Lite: 15 RPM, 500 RPD (recommended — far higher daily quota)
+var MODEL = 'gemini-3.1-flash-lite';
+var RPM_LIMIT = 15;
+var RPD_LIMIT = 500;
+function spacingMs() { return Math.ceil(60000 / Math.max(1, RPM_LIMIT)) + 500; } // +0.5s margin
+
+var rpmChain = Promise.resolve();
+var lastCallAt = 0;
+var rpdState = null; // { day: 'YYYY-M-D', count: n }, persisted
+
+function todayKey() {
+  var d = new Date();
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+
+// Serialize + space calls so concurrent batches can't burst past the RPM limit.
+function rpmThrottle() {
+  rpmChain = rpmChain.then(async function () {
+    var wait = Math.max(0, lastCallAt + spacingMs() - Date.now());
+    if (wait > 0) await new Promise(function (r) { setTimeout(r, wait); });
+    lastCallAt = Date.now();
+  });
+  return rpmChain;
+}
+
+async function checkDailyBudget() {
+  if (!rpdState) rpdState = (await store.get('rengage-ai-rpd')) || { day: todayKey(), count: 0 };
+  if (rpdState.day !== todayKey()) rpdState = { day: todayKey(), count: 0 };
+  if (rpdState.count >= RPD_LIMIT) {
+    throw new Error('Daily AI budget reached (' + RPD_LIMIT + '). Resets tomorrow.');
+  }
+  rpdState.count += 1;
+  await store.set('rengage-ai-rpd', rpdState);
+}
+
+export async function getAiBudget() {
+  if (!rpdState || rpdState.day !== todayKey()) {
+    rpdState = (await store.get('rengage-ai-rpd')) || { day: todayKey(), count: 0 };
+    if (rpdState.day !== todayKey()) rpdState = { day: todayKey(), count: 0 };
+  }
+  return { used: rpdState.count, limit: RPD_LIMIT };
+}
+
+export function getAiConfig() {
+  return { model: MODEL, rpm: RPM_LIMIT, rpd: RPD_LIMIT };
+}
+
+export async function setAiConfig(cfg) {
+  if (cfg.model != null) { MODEL = cfg.model; await store.set('rengage-ai-model', cfg.model); }
+  if (cfg.rpm != null) { RPM_LIMIT = cfg.rpm; await store.set('rengage-ai-rpm', cfg.rpm); }
+  if (cfg.rpd != null) { RPD_LIMIT = cfg.rpd; await store.set('rengage-ai-rpd-limit', cfg.rpd); }
+}
+
 export async function loadApiKey() {
   apiKey = await store.get('rengage-gemini-key');
   var saved = await store.get('rengage-usage');
   if (saved) usageLog = saved;
+  var lim = await store.get('rengage-ai-rpd-limit');
+  if (lim) RPD_LIMIT = lim;
+  var m = await store.get('rengage-ai-model');
+  if (m) MODEL = m;
+  var rpm = await store.get('rengage-ai-rpm');
+  if (rpm) RPM_LIMIT = rpm;
   return apiKey;
 }
 
@@ -58,6 +120,10 @@ export async function callAI(prompt, systemPrompt, purpose) {
 async function callGemini(prompt, systemPrompt, purpose) {
   if (!apiKey) throw new Error('No API key configured');
 
+  // Stay within free-tier RPM/RPD before spending a call.
+  await rpmThrottle();
+  await checkDailyBudget();
+
   var contents = [];
   if (systemPrompt) {
     contents.push({ role: 'user', parts: [{ text: systemPrompt }] });
@@ -65,7 +131,7 @@ async function callGemini(prompt, systemPrompt, purpose) {
   }
   contents.push({ role: 'user', parts: [{ text: prompt }] });
 
-  var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + apiKey;
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent?key=' + apiKey;
   var res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -161,8 +227,8 @@ var SCORE_SYSTEM = 'You are evaluating Reddit posts for marketing relevance. Giv
 export async function aiScorePosts(posts, campaignContext) {
   if (!posts.length) return [];
 
-  // Batch into groups of 10 to keep token count manageable
-  var BATCH_SIZE = 10;
+  // Batch into groups of 20 to halve the number of scoring calls
+  var BATCH_SIZE = 20;
   var allScores = [];
 
   for (var i = 0; i < posts.length; i += BATCH_SIZE) {

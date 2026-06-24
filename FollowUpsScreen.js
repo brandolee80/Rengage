@@ -4,9 +4,10 @@ import {
   ActivityIndicator, Linking, Alert, Clipboard,
 } from 'react-native';
 import { timeAgo } from './scoring';
+import store from './store';
 
 export default function FollowUpsScreen({
-  colors, commentLog, username, checkFollowUps,
+  colors, commentLog, username, checkFollowUps, fetchInboxReplies, inboxUrl,
   generateReplies, campaigns, onLogPost, getFrequencyWarning,
   onCountUpdate,
 }) {
@@ -17,29 +18,83 @@ export default function FollowUpsScreen({
   var [replies, setReplies] = useState({});
   var [replyLoading, setReplyLoading] = useState(null);
   var [lastChecked, setLastChecked] = useState(null);
+  var [handled, setHandled] = useState({}); // reply link -> dismissed-at timestamp
 
   useEffect(function () {
     refresh();
+  }, [inboxUrl, username]);
+
+  // Load dismissed follow-ups, pruning entries older than 60 days.
+  useEffect(function () {
+    (async function () {
+      var h = await store.get('rengage-followup-handled');
+      if (!h) return;
+      var cutoff = Date.now() - 60 * 86400000;
+      var cleaned = {};
+      Object.keys(h).forEach(function (k) { if (h[k] > cutoff) cleaned[k] = h[k]; });
+      setHandled(cleaned);
+      if (Object.keys(cleaned).length !== Object.keys(h).length) store.set('rengage-followup-handled', cleaned);
+    })();
   }, []);
 
+  // Keep the tab badge in sync with what's actually visible (not dismissed).
+  useEffect(function () {
+    var n = followUps.filter(function (f) { return !handled[f.postUrl]; }).length;
+    if (onCountUpdate) onCountUpdate(n);
+  }, [followUps, handled]);
+
+  function dismiss(fu) {
+    var next = Object.assign({}, handled);
+    next[fu.postUrl] = Date.now();
+    setHandled(next);
+    store.set('rengage-followup-handled', next);
+    if (expanded === fu.postUrl + fu.latestReply.author) setExpanded(null);
+  }
+
+  // Match a reply's subreddit to a campaign (for context + tagging).
+  function campaignForSub(sub) {
+    var s = (sub || '').toLowerCase();
+    return campaigns.find(function (c) {
+      return (c.subs || []).some(function (x) { return x.replace(/^r\//i, '').trim().toLowerCase() === s; });
+    });
+  }
+
   async function refresh() {
-    if (!username) {
-      setError('Set your Reddit username in Settings first');
-      return;
-    }
-    var commentCount = Object.keys(commentLog).length;
-    if (commentCount === 0) {
-      setError('No commented posts to check yet. Start engaging first.');
+    if (!inboxUrl) {
+      setFollowUps([]);
+      setError('Add your Reddit inbox RSS URL in Settings to detect replies.');
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      var results = await checkFollowUps(commentLog, username);
-      setFollowUps(results);
+      var res = await fetchInboxReplies(inboxUrl);
+      if (res.error) {
+        setFollowUps([]);
+        setError('Could not load inbox feed: ' + (res.error === 'no-url' ? 'no URL set' : res.error.slice(0, 90)));
+        setLoading(false);
+        return;
+      }
+      var userLower = (username || '').toLowerCase();
+      var items = (res.items || [])
+        // Don't surface your own replies as follow-ups.
+        .filter(function (it) { return !userLower || it.author.toLowerCase() !== userLower; })
+        .map(function (it) {
+          var camp = campaignForSub(it.subreddit);
+          return {
+            postUrl: it.link,
+            postTitle: it.title,
+            subreddit: it.subreddit,
+            campaign: camp ? camp.name : '',
+            myComment: '',
+            latestReply: { author: it.author, body: it.body, created_utc: it.created_utc },
+            replyCount: 1,
+            needsFollowUp: true,
+            commentedAt: null,
+          };
+        });
+      setFollowUps(items);
       setLastChecked(new Date());
-      var actionable = results.filter(function (f) { return f.needsFollowUp; }).length;
-      if (onCountUpdate) onCountUpdate(actionable);
     } catch (e) {
       setError(e.message);
     }
@@ -92,11 +147,12 @@ export default function FollowUpsScreen({
     Clipboard.setString(replyText);
     if (onLogPost) onLogPost(fu.subreddit);
     Linking.openURL(fu.postUrl);
+    dismiss(fu); // you've engaged — clear it from the list
     Alert.alert('Reply Copied', 'Paste your follow-up in Reddit.');
   }
 
-  var needsAction = followUps.filter(function (f) { return f.needsFollowUp; });
-  var responded = followUps.filter(function (f) { return !f.needsFollowUp; });
+  var needsAction = followUps.filter(function (f) { return !handled[f.postUrl]; });
+  var responded = [];
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.bg }}>
@@ -131,7 +187,7 @@ export default function FollowUpsScreen({
         <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
           <ActivityIndicator size="large" color={colors.primary} />
           <Text style={{ color: colors.textMuted, marginTop: 12, fontSize: 13 }}>
-            Checking {Object.keys(commentLog).length} posts for replies...
+            Loading your inbox replies...
           </Text>
         </View>
       ) : (
@@ -176,10 +232,10 @@ export default function FollowUpsScreen({
           })}
 
           {/* Empty state */}
-          {!loading && followUps.length === 0 && !error ? (
+          {!loading && needsAction.length === 0 && !error ? (
             <View style={{ alignItems: 'center', paddingTop: 60 }}>
               <Text style={{ color: colors.textMuted, fontSize: 14, textAlign: 'center', lineHeight: 22 }}>
-                No replies to your comments yet.{'\n'}Keep engaging and check back later.
+                No replies in your inbox feed yet.{'\n'}When someone replies to you, it'll show here.
               </Text>
             </View>
           ) : null}
@@ -225,13 +281,15 @@ export default function FollowUpsScreen({
             ) : null}
           </View>
 
-          {/* Your comment */}
-          <View style={{ backgroundColor: colors.card2, borderRadius: 6, padding: 10, marginTop: 10 }}>
-            <Text style={{ color: colors.textMuted, fontSize: 10, fontWeight: '600', marginBottom: 3 }}>Your comment</Text>
-            <Text style={{ color: colors.textSecondary, fontSize: 12, lineHeight: 17 }} numberOfLines={3}>
-              {fu.myComment}
-            </Text>
-          </View>
+          {/* Your comment (only when known) */}
+          {fu.myComment ? (
+            <View style={{ backgroundColor: colors.card2, borderRadius: 6, padding: 10, marginTop: 10 }}>
+              <Text style={{ color: colors.textMuted, fontSize: 10, fontWeight: '600', marginBottom: 3 }}>Your comment</Text>
+              <Text style={{ color: colors.textSecondary, fontSize: 12, lineHeight: 17 }} numberOfLines={3}>
+                {fu.myComment}
+              </Text>
+            </View>
+          ) : null}
 
           {/* Their reply */}
           <View style={{
@@ -304,6 +362,14 @@ export default function FollowUpsScreen({
             </TouchableOpacity>
           </View>
         ) : null}
+
+        {/* Dismiss — hide whether or not you follow up */}
+        <TouchableOpacity
+          onPress={function () { dismiss(fu); }}
+          style={{ marginTop: 10, paddingVertical: 6, alignItems: 'center' }}
+        >
+          <Text style={{ color: colors.textMuted, fontSize: 12 }}>Dismiss</Text>
+        </TouchableOpacity>
       </View>
     );
   }

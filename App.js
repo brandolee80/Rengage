@@ -3,8 +3,9 @@ import { View, Text, TouchableOpacity, Alert, StatusBar, SafeAreaView } from 're
 import Ionicons from '@expo/vector-icons/Ionicons';
 import useTheme from './useTheme';
 import store from './store';
-import { loadUsername, saveUsername, getUsername, fetchSubredditPosts, loadPostLog, logPost, getPostFrequencyWarning, checkFollowUps } from './reddit';
+import { loadUsername, saveUsername, getUsername, fetchSubredditPosts, searchSubredditPosts, loadPostLog, logPost, getPostFrequencyWarning, checkFollowUps, fetchInboxReplies } from './reddit';
 import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts } from './ai';
+import { scorePost, AI_SCORE_MIN_LOCAL } from './scoring';
 import CampaignsList from './CampaignsList';
 import CampaignSetup from './CampaignSetup';
 import ResultsScreen from './ResultsScreen';
@@ -29,6 +30,8 @@ export default function App() {
   var [postLog, setPostLog] = useState([]);
   var [followUpCount, setFollowUpCount] = useState(0);
   var [purgeDays, setPurgeDays] = useState(DEFAULT_PURGE_DAYS);
+  var [repollMinutes, setRepollMinutes] = useState(60);
+  var [inboxUrl, setInboxUrl] = useState('');
   var [loaded, setLoaded] = useState(false);
 
   useEffect(function () {
@@ -50,6 +53,10 @@ export default function App() {
       setPostLog(pl);
       var pd = await store.get('rengage-purgedays');
       if (pd) setPurgeDays(pd);
+      var rm = await store.get('rengage-repollmins');
+      if (rm) setRepollMinutes(rm);
+      var iu = await store.get('rengage-inbox-url');
+      if (iu) setInboxUrl(iu);
       setLoaded(true);
     })();
   }, []);
@@ -112,6 +119,23 @@ export default function App() {
     setScreen('editCampaign');
   }
 
+  // Drop saved posts whose subreddit is no longer covered by any campaign
+  // (e.g. you removed a sub because you got banned there).
+  function pruneOrphanPosts(campaignList) {
+    var valid = {};
+    campaignList.forEach(function (c) {
+      (c.subs || []).forEach(function (s) {
+        valid[s.replace(/^r\//i, '').trim().toLowerCase()] = true;
+      });
+    });
+    setSavedPosts(function (prev) {
+      var kept = prev.filter(function (p) { return valid[(p.subreddit || '').toLowerCase()]; });
+      if (kept.length === prev.length) return prev;
+      store.set('rengage-savedposts', kept);
+      return kept;
+    });
+  }
+
   function handleDeleteCampaign(idx) {
     Alert.alert('Delete Campaign', 'Delete "' + campaigns[idx].name + '"?', [
       { text: 'Cancel', style: 'cancel' },
@@ -120,21 +144,98 @@ export default function App() {
           var next = campaigns.slice();
           next.splice(idx, 1);
           saveCampaigns(next);
+          pruneOrphanPosts(next);
         }
       },
     ]);
   }
 
+  // Re-run AI scoring on a campaign's saved posts after its context changes.
+  // Uses a functional state update so any post a poll appends mid-rescore is
+  // preserved (the AI call is async).
+  async function rescoreCampaign(oldName, campaign) {
+    if (!hasApiKey()) {
+      Alert.alert('No API Key', 'Add a Gemini API key in Settings to rescore posts with the new context.');
+      return;
+    }
+    var targets = savedPosts.filter(function (p) { return p._campaign === oldName; });
+    if (targets.length === 0) {
+      Alert.alert('Nothing to Rescore', 'No saved posts are tagged to this campaign yet.');
+      return;
+    }
+    Alert.alert('Rescoring', 'Updating scores for ' + targets.length + ' post' + (targets.length === 1 ? '' : 's') + '…');
+
+    // Only AI-rescore posts the heuristic rates as promising (saves quota).
+    var toScore = targets.filter(function (p) { return scorePost(p, campaign.keywords || []) >= AI_SCORE_MIN_LOCAL; });
+
+    var scoreMap = {};
+    if (toScore.length > 0) {
+      var aiScores = [];
+      try {
+        aiScores = await aiScorePosts(toScore, campaign.context);
+      } catch (e) {
+        console.warn('Rescore failed:', e.message);
+      }
+      aiScores.forEach(function (s) {
+        if (s && s.id && typeof s.score === 'number') scoreMap[s.id] = s;
+      });
+    }
+
+    var targetIds = {};
+    targets.forEach(function (p) { targetIds[p.id] = true; });
+
+    setSavedPosts(function (prev) {
+      var updated = prev.map(function (p) {
+        if (!targetIds[p.id]) {
+          // Posts added after this rescore started: just keep the campaign name in sync.
+          if (p._campaign === oldName && oldName !== campaign.name) {
+            var rt = Object.assign({}, p);
+            rt._campaign = campaign.name;
+            return rt;
+          }
+          return p;
+        }
+        var np = Object.assign({}, p);
+        np._campaign = campaign.name;
+        np._context = campaign.context;
+        // Only re-blend posts we actually AI-scored; others keep their score.
+        if (scoreMap[p.id]) {
+          var local = scorePost(p, campaign.keywords || []);
+          np._local = local;
+          np._ai = scoreMap[p.id].score;
+          np._s = Math.round(local * 0.3 + np._ai * 0.7);
+          np._aiReason = scoreMap[p.id].reason || '';
+        }
+        return np;
+      });
+      store.set('rengage-savedposts', updated);
+      return updated;
+    });
+
+    var n = Object.keys(scoreMap).length;
+    var msg = n > 0 ? ('Rescored ' + n + ' post' + (n === 1 ? '' : 's') + ' with the new context.')
+      : toScore.length > 0 ? 'AI rescore failed — kept existing scores.'
+      : 'No posts were promising enough to rescore.';
+    Alert.alert('Rescore', msg);
+  }
+
   function handleSaveCampaign(campaign) {
+    var isEdit = screen === 'editCampaign' && editIndex !== null;
+    var oldCampaign = isEdit ? campaigns[editIndex] : null;
+    var contextDirty = !!oldCampaign && (oldCampaign.context || '') !== (campaign.context || '');
+
     var next = campaigns.slice();
-    if (screen === 'editCampaign' && editIndex !== null) {
+    if (isEdit) {
       next[editIndex] = campaign;
     } else {
       next.push(campaign);
     }
     saveCampaigns(next);
+    pruneOrphanPosts(next);
     setScreen(null);
     setEditIndex(null);
+
+    if (contextDirty) rescoreCampaign(oldCampaign.name, campaign);
   }
 
   function handleCancelSetup() {
@@ -175,6 +276,16 @@ export default function App() {
     await store.set('rengage-purgedays', days);
   }
 
+  async function handleSaveRepollMinutes(mins) {
+    setRepollMinutes(mins);
+    await store.set('rengage-repollmins', mins);
+  }
+
+  async function handleSaveInboxUrl(url) {
+    setInboxUrl(url);
+    await store.set('rengage-inbox-url', url);
+  }
+
   if (!loaded) {
     return (
       <View style={{ flex: 1, backgroundColor: colors.bg, justifyContent: 'center', alignItems: 'center' }}>
@@ -213,11 +324,14 @@ export default function App() {
         savedPosts={savedPosts}
         onSavePosts={saveSavedPosts}
         fetchPosts={fetchSubredditPosts}
+        searchPosts={searchSubredditPosts}
         generateReplies={generateReplies}
         aiScorePosts={aiScorePosts}
         username={username}
         getFrequencyWarning={getPostFrequencyWarning}
         onLogPost={handleLogPost}
+        purgeDays={purgeDays}
+        repollMinutes={repollMinutes}
       />
     );
   } else if (tab === 'followups') {
@@ -227,6 +341,8 @@ export default function App() {
         commentLog={commentLog}
         username={username}
         checkFollowUps={checkFollowUps}
+        fetchInboxReplies={fetchInboxReplies}
+        inboxUrl={inboxUrl}
         generateReplies={generateReplies}
         campaigns={campaigns}
         onLogPost={handleLogPost}
@@ -259,6 +375,10 @@ export default function App() {
         postLog={postLog}
         purgeDays={purgeDays}
         onSavePurgeDays={handleSavePurgeDays}
+        repollMinutes={repollMinutes}
+        onSaveRepollMinutes={handleSaveRepollMinutes}
+        inboxUrl={inboxUrl}
+        onSaveInboxUrl={handleSaveInboxUrl}
       />
     );
   }
