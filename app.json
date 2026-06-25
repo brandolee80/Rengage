@@ -10,11 +10,16 @@
     "splash": {
       "backgroundColor": "#111318"
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.sheffco.rengage",
-      "buildNumber": "1"
+      "buildNumber": "1",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -22,6 +27,12 @@
       },
       "package": "com.sheffco.rengage"
     },
-    "plugins": []
+    "plugins": [],
+    "extra": {
+      "eas": {
+        "projectId": "c8b3a95a-1329-4820-8163-2bca799f0066"
+      }
+    },
+    "owner": "brandolee80"
   }
 }
