@@ -659,6 +659,13 @@ export default function ResultsScreen({
           } else if (post._aiReason) {
             aiScore = Math.max(0, Math.min(100, Math.round((post._s - localScore * 0.3) / 0.7)));
           }
+          // "pending" only if it's promising enough to actually get scored later;
+          // low scorers are deliberately skipped (saves quota) and won't update.
+          var aiPending = aiScore == null && !post._aiTried && localScore >= AI_SCORE_MIN_LOCAL;
+          var aiLabel = aiScore != null ? 'AI ' + aiScore
+            : post._aiTried ? 'AI n/a'
+            : aiPending ? 'AI pending'
+            : 'AI skipped';
 
           return (
             <View key={post.url + idx} style={{
@@ -689,13 +696,8 @@ export default function ResultsScreen({
                       <Text style={{ color: colors.textMuted, fontSize: 10 }}>
                         local {localScore}
                       </Text>
-                      <Text style={{
-                        color: (aiScore == null && !post._aiTried) ? colors.accent : colors.textMuted,
-                        fontSize: 10,
-                      }}>
-                        {aiScore != null ? 'AI ' + aiScore
-                          : post._aiTried ? 'AI n/a'
-                          : 'AI pending'}
+                      <Text style={{ color: aiPending ? colors.accent : colors.textMuted, fontSize: 10 }}>
+                        {aiLabel}
                       </Text>
                     </View>
                     {post._campaign ? (
