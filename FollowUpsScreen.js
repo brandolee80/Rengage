@@ -9,8 +9,12 @@ import store from './store';
 export default function FollowUpsScreen({
   colors, commentLog, username, checkFollowUps, fetchInboxReplies, inboxUrl,
   generateReplies, campaigns, onLogPost, getFrequencyWarning,
-  onCountUpdate,
+  onCountUpdate, onRengaged, rengageCooldownMins, lastRengageAt,
 }) {
+  var rengageUntil = (lastRengageAt || 0) + (rengageCooldownMins || 0) * 60000;
+  var rengageRemainingMs = rengageUntil - Date.now();
+  var rengageActive = rengageRemainingMs > 0;
+  var rengageRemainingMin = Math.ceil(rengageRemainingMs / 60000);
   var [followUps, setFollowUps] = useState([]);
   var [loading, setLoading] = useState(false);
   var [error, setError] = useState(null);
@@ -19,6 +23,13 @@ export default function FollowUpsScreen({
   var [replyLoading, setReplyLoading] = useState(null);
   var [lastChecked, setLastChecked] = useState(null);
   var [handled, setHandled] = useState({}); // reply link -> dismissed-at timestamp
+  var [, setClockTick] = useState(0);
+
+  // Re-render periodically so the Rengage cooldown counts down and re-enables.
+  useEffect(function () {
+    var id = setInterval(function () { setClockTick(function (t) { return t + 1; }); }, 10000);
+    return function () { clearInterval(id); };
+  }, []);
 
   useEffect(function () {
     refresh();
@@ -148,6 +159,7 @@ export default function FollowUpsScreen({
     if (onLogPost) onLogPost(fu.subreddit);
     Linking.openURL(fu.postUrl);
     dismiss(fu); // you've engaged — clear it from the list
+    if (onRengaged) onRengaged();
     Alert.alert('Reply Copied', 'Paste your follow-up in Reddit.');
   }
 
@@ -340,13 +352,15 @@ export default function FollowUpsScreen({
                   <Text style={{ color: colors.text, fontSize: 13, lineHeight: 19 }}>{r.text}</Text>
                   <TouchableOpacity
                     onPress={function () { handleReply(fu, r.text); }}
+                    disabled={rengageActive}
                     style={{
                       marginTop: 8, padding: 10, borderRadius: 6, alignItems: 'center',
-                      backgroundColor: isRec ? colors.green : colors.card2,
+                      backgroundColor: rengageActive ? colors.card2 : (isRec ? colors.green : colors.card2),
+                      opacity: rengageActive ? 0.6 : 1,
                     }}
                   >
-                    <Text style={{ color: isRec ? '#000' : colors.text, fontWeight: '600', fontSize: 13 }}>
-                      Rengage
+                    <Text style={{ color: rengageActive ? colors.textMuted : (isRec ? '#000' : colors.text), fontWeight: '600', fontSize: 13 }}>
+                      {rengageActive ? 'Cooldown · ' + rengageRemainingMin + 'm' : 'Rengage'}
                     </Text>
                   </TouchableOpacity>
                 </View>

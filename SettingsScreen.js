@@ -1,12 +1,32 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, TextInput, ScrollView } from 'react-native';
+import { View, Text, TouchableOpacity, TextInput, ScrollView, Alert } from 'react-native';
 import { getAiBudget, getAiConfig, setAiConfig, getUsage } from './ai';
 
-export default function SettingsScreen({ colors, isDark, toggleTheme, username, onSaveUsername, apiKey, onSaveApiKey, postLog, purgeDays, onSavePurgeDays, repollMinutes, onSaveRepollMinutes, inboxUrl, onSaveInboxUrl }) {
+export default function SettingsScreen({ colors, isDark, toggleTheme, username, onSaveUsername, apiKey, onSaveApiKey, postLog, purgeDays, onSavePurgeDays, repollMinutes, onSaveRepollMinutes, inboxUrl, onSaveInboxUrl, rengageCooldownMins, onSaveCooldownMins }) {
   var [keyInput, setKeyInput] = useState(apiKey || '');
   var [nameInput, setNameInput] = useState(username || '');
   var [inboxInput, setInboxInput] = useState(inboxUrl || '');
   var [inboxSaved, setInboxSaved] = useState(false);
+  var [cooldownInput, setCooldownInput] = useState(String(rengageCooldownMins != null ? rengageCooldownMins : 5));
+
+  function handleSaveCooldown() {
+    var m = parseInt(cooldownInput);
+    if (isNaN(m) || m < 0) m = 5;
+    if (m > 1440) m = 1440;
+    var save = function () { setCooldownInput(String(m)); onSaveCooldownMins(m); };
+    if (m < 5) {
+      Alert.alert(
+        'Are you sure?',
+        'A cooldown under 5 minutes lets you post several comments in quick succession. That looks like a bot and can get your account banned. Real engagement takes time to scroll, read, and write. Keep it this short anyway?',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Use ' + m + ' min anyway', style: 'destructive', onPress: save },
+        ]
+      );
+    } else {
+      save();
+    }
+  }
   var [purgeInput, setPurgeInput] = useState(String(purgeDays || 7));
   var [repollInput, setRepollInput] = useState(String(repollMinutes || 60));
   var [keySaved, setKeySaved] = useState(false);
@@ -302,6 +322,37 @@ export default function SettingsScreen({ colors, isDark, toggleTheme, username, 
               setPurgeInput(String(days));
               onSavePurgeDays(days);
             }}
+            style={{ backgroundColor: colors.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 6 }}
+          >
+            <Text style={{ color: '#fff', fontWeight: '600', fontSize: 13 }}>Save</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* Rengage Cooldown */}
+      <View style={{
+        backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
+        borderRadius: 12, padding: 16, marginBottom: 16,
+      }}>
+        <Text style={{ color: colors.textSecondary, fontSize: 13, fontWeight: '600', marginBottom: 4 }}>Rengage Cooldown</Text>
+        <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 10, lineHeight: 16 }}>
+          After you post a Reddit comment, all Rengage buttons stay disabled for this long. Posting several
+          comments within seconds looks like a bot and risks a ban — real engagement takes time. Default 5 minutes.
+        </Text>
+        <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+          <TextInput
+            style={{
+              backgroundColor: colors.inputBg, borderColor: colors.inputBorder,
+              borderWidth: 1, borderRadius: 8, padding: 10, fontSize: 14,
+              color: colors.text, width: 60, textAlign: 'center',
+            }}
+            value={cooldownInput}
+            onChangeText={setCooldownInput}
+            keyboardType="number-pad"
+          />
+          <Text style={{ color: colors.textMuted, fontSize: 13 }}>minutes</Text>
+          <TouchableOpacity
+            onPress={handleSaveCooldown}
             style={{ backgroundColor: colors.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 6 }}
           >
             <Text style={{ color: '#fff', fontWeight: '600', fontSize: 13 }}>Save</Text>

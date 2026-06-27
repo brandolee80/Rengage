@@ -1,0 +1,216 @@
+// Marketing module — data model, storage, and local (non-AI) logic for the
+// marketing action-plan feature. AI decides strategy + content elsewhere; this
+// file is pure plumbing: ids, dates, scoring math, persistence.
+
+import store from './store';
+
+// ── IDs ──
+export function newId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// ── App Store listing import (free iTunes Lookup API; iOS only) ──
+export function parseAppStoreId(url) {
+  if (!url) return '';
+  var m = url.match(/\/id(\d{4,})/i) || url.match(/[?&]id=(\d{4,})/i);
+  if (m) return m[1];
+  var bare = url.match(/(\d{6,})/);
+  return bare ? bare[1] : '';
+}
+
+export function isPlayLink(url) {
+  return /play\.google\.com/i.test(url || '');
+}
+
+// Returns { appStoreId, name, description, genre, rating, ratingCount, price, seller, url }.
+export async function fetchAppStoreListing(url) {
+  var id = parseAppStoreId(url);
+  if (!id) throw new Error('Could not find an App Store id in that link.');
+  var res = await fetch('https://itunes.apple.com/lookup?id=' + id);
+  if (!res.ok) throw new Error('App Store lookup failed (' + res.status + ').');
+  var data = await res.json();
+  if (!data.results || data.results.length === 0) throw new Error('No app found for that link.');
+  var a = data.results[0];
+  return {
+    appStoreId: id,
+    name: a.trackName || '',
+    description: a.description || '',
+    genre: (a.genres || []).join(', '),
+    rating: a.averageUserRating || null,
+    ratingCount: a.userRatingCount || null,
+    price: a.formattedPrice || '',
+    seller: a.sellerName || '',
+    url: a.trackViewUrl || url,
+  };
+}
+
+// ── Campaign colors (assigned by creation order) ──
+export var CAMPAIGN_COLORS = [
+  '#E5453C', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6',
+  '#EC4899', '#14B8A6', '#F97316', '#6366F1', '#84CC16',
+];
+
+export function campaignColor(index) {
+  return CAMPAIGN_COLORS[index % CAMPAIGN_COLORS.length];
+}
+
+// ── Action item shape (for reference) ──
+// {
+//   id, campaignId, campaignName, platform, type: 'one-time'|'recurring',
+//   title,
+//   content: { body, fields: [{label, value}] } | null,  // null until generated (lazy)
+//   generated: bool,
+//   dueDate: ISO, dueTime: string|null,
+//   completedDate: ISO|null,
+//   recurrenceInterval: number(days)|null,
+//   impactWeight: 1-5,
+//   removed: bool, removalReason: 'not-relevant'|'different-way'|'skipping'|null,
+// }
+
+var DAY_MS = 86400000;
+
+// Turn an AI plan skeleton into full action-item objects (content stays null —
+// it's generated lazily when the user opens the item).
+export function buildActionItems(campaign, skeleton) {
+  var now = Date.now();
+  return (skeleton || []).filter(function (s) { return s && s.platform && s.title; }).map(function (s) {
+    var dueInDays = typeof s.dueInDays === 'number' ? s.dueInDays : 3;
+    var recurring = s.type === 'recurring';
+    return {
+      id: newId(),
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      platform: s.platform,
+      type: recurring ? 'recurring' : 'one-time',
+      title: s.title,
+      rationale: s.rationale || '',
+      content: null,
+      generated: false,
+      dueDate: new Date(now + dueInDays * DAY_MS).toISOString(),
+      dueTime: null,
+      completedDate: null,
+      recurrenceInterval: recurring ? (s.recurrenceInterval || 7) : null,
+      impactWeight: Math.max(1, Math.min(5, s.impactWeight || 3)),
+      removed: false,
+      removalReason: null,
+    };
+  });
+}
+
+function startOfDay(d) {
+  var x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+// Derived status — never stored, always computed against "now".
+export function itemStatus(item, now) {
+  now = now || Date.now();
+  if (item.removed) return item.removalReason === 'skipping' ? 'skipped' : 'removed';
+  if (item.completedDate) return 'completed';
+  if (item.dueDate && startOfDay(item.dueDate).getTime() < startOfDay(now).getTime()) return 'overdue';
+  return 'pending';
+}
+
+function completedOnTime(item) {
+  if (!item.completedDate || !item.dueDate) return true;
+  return startOfDay(item.completedDate).getTime() <= startOfDay(item.dueDate).getTime();
+}
+
+// ── Effort score (0-100), impact-weighted with a timeliness multiplier ──
+// numerator   = sum of completed weight * (1.0 on time, 0.5 late)
+// denominator = sum of weight for items that count: completed, pending, overdue, skipped
+//               (items removed as not-relevant / different-way are excluded entirely)
+export function effortScore(items) {
+  var num = 0;
+  var den = 0;
+  items.forEach(function (it) {
+    var st = itemStatus(it);
+    if (st === 'removed') return; // not-relevant / different-way: excluded both sides
+    var w = it.impactWeight || 1;
+    if (st === 'completed') {
+      num += w * (completedOnTime(it) ? 1.0 : 0.5);
+      den += w;
+    } else if (st === 'skipped' || st === 'pending' || st === 'overdue') {
+      den += w; // counts against you, contributes nothing
+    }
+  });
+  if (den === 0) return null;
+  return Math.round((num / den) * 100);
+}
+
+export function effortColor(score, colors) {
+  if (score == null) return colors.textMuted;
+  if (score >= 70) return colors.green;
+  if (score >= 40) return colors.accent;
+  return colors.red;
+}
+
+// ── Recurrence: next occurrence after completing a recurring item ──
+export function nextOccurrence(item, completedDate) {
+  if (item.type !== 'recurring' || !item.recurrenceInterval) return null;
+  var base = completedDate ? new Date(completedDate) : new Date();
+  var due = new Date(base.getTime() + item.recurrenceInterval * DAY_MS);
+  return {
+    id: newId(),
+    campaignId: item.campaignId,
+    campaignName: item.campaignName,
+    platform: item.platform,
+    type: 'recurring',
+    title: item.title,
+    content: null,          // generated fresh on demand, not copied
+    generated: false,
+    dueDate: due.toISOString(),
+    dueTime: item.dueTime || null,
+    completedDate: null,
+    recurrenceInterval: item.recurrenceInterval,
+    impactWeight: item.impactWeight || 3,
+    removed: false,
+    removalReason: null,
+  };
+}
+
+// ── "Due this week" + overdue filter ──
+export function isDueThisWeekOrOverdue(item, now) {
+  now = now || Date.now();
+  var st = itemStatus(item, now);
+  if (st === 'completed' || st === 'removed' || st === 'skipped') return false;
+  if (st === 'overdue') return true;
+  if (!item.dueDate) return true;
+  var weekEnd = startOfDay(now).getTime() + 7 * DAY_MS;
+  return startOfDay(item.dueDate).getTime() <= weekEnd;
+}
+
+// ── Metrics trend (local, deterministic — no AI) ──
+// Compares the most recent value to the prior one for a field; returns a label
+// and direction so the UI can color momentum without spending a Gemini call.
+export function metricsTrend(entries, field) {
+  var pts = (entries || [])
+    .filter(function (e) { return typeof e[field] === 'number'; })
+    .sort(function (a, b) { return new Date(a.date) - new Date(b.date); });
+  if (pts.length < 2) return { direction: 'unknown', label: 'not enough data', delta: 0 };
+  var last = pts[pts.length - 1][field];
+  var prev = pts[pts.length - 2][field];
+  var delta = last - prev;
+  var pct = prev === 0 ? (last > 0 ? 1 : 0) : delta / prev;
+  if (pct > 0.05) return { direction: 'growing', label: 'growing', delta: delta };
+  if (pct < -0.05) return { direction: 'declining', label: 'declining', delta: delta };
+  return { direction: 'flat', label: 'flat', delta: delta };
+}
+
+// ── Persistence (per campaign) ──
+function actionsKey(campaignId) { return 'rengage-actions-' + campaignId; }
+function metricsKey(campaignId) { return 'rengage-metrics-' + campaignId; }
+
+export async function loadActionItems(campaignId) {
+  return (await store.get(actionsKey(campaignId))) || [];
+}
+export async function saveActionItems(campaignId, items) {
+  await store.set(actionsKey(campaignId), items);
+}
+export async function loadMetrics(campaignId) {
+  return (await store.get(metricsKey(campaignId))) || [];
+}
+export async function saveMetrics(campaignId, entries) {
+  await store.set(metricsKey(campaignId), entries);
+}

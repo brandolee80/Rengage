@@ -132,18 +132,28 @@ async function callGemini(prompt, systemPrompt, purpose) {
   contents.push({ role: 'user', parts: [{ text: prompt }] });
 
   var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent?key=' + apiKey;
-  var res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: contents }),
-  });
+  var reqBody = JSON.stringify({ contents: contents });
 
-  if (!res.ok) {
-    var errText = await res.text();
+  // Retry transient errors (503 overloaded, 500, 429) with backoff.
+  var data = null;
+  var maxAttempts = 3;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    var res;
+    try {
+      res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: reqBody });
+    } catch (e) {
+      if (attempt < maxAttempts) { await new Promise(function (r) { setTimeout(r, 1000 * attempt); }); continue; }
+      throw new Error('Network error: ' + e.message);
+    }
+    if (res.ok) { data = await res.json(); break; }
+    if ((res.status === 503 || res.status === 500 || res.status === 429) && attempt < maxAttempts) {
+      await new Promise(function (r) { setTimeout(r, 1500 * attempt); });
+      continue;
+    }
+    var errText = await res.text().catch(function () { return ''; });
     throw new Error('Gemini ' + res.status + ': ' + errText.slice(0, 200));
   }
-
-  var data = await res.json();
+  if (!data) throw new Error('Gemini is busy (overloaded). Please try again in a moment.');
   if (data.error) throw new Error(data.error.message);
 
   var txt = '';
@@ -223,6 +233,53 @@ export async function generateReplies(post, campaignContext) {
 // ── AI relevance scoring (pass 2) ──
 // Takes posts that passed keyword matching and scores them with AI context
 var SCORE_SYSTEM = 'You are evaluating Reddit posts for marketing relevance. Given a product context and a batch of posts, rate each post 0-100 on how natural and effective it would be to leave a helpful comment that subtly mentions the product concept.\n\nScore higher for:\n- Posts where the user has a problem the product solves\n- Posts asking for recommendations or advice\n- Posts expressing frustration with current solutions\n- Fewer existing comments (more visibility)\n\nScore lower for:\n- Posts where mentioning the product would feel forced\n- Posts that are just news or announcements\n- Posts with 100+ comments already\n\nReturn a JSON array of objects: [{"id":"post_id","score":75,"reason":"one sentence why"}]\nOutput ONLY the JSON array.';
+
+// ── Marketing plan generation ──
+var PLAN_SYSTEM = 'You are a pragmatic startup marketing strategist. Given a product\'s marketing context and market grade, design a concrete marketing action plan tailored to THIS specific product and audience. Decide which channels make sense — do not limit yourself to common examples. A B2B tool might use LinkedIn and Hacker News; a consumer app TikTok and Instagram; a dev tool Hacker News and Reddit. Think holistically.\n\nIMPORTANT about Reddit: ongoing Reddit commenting and replying is handled by a separate feature, so NEVER create actions about commenting, replying, or answering questions in subreddits, and NEVER suggest promotional posts in topical communities (e.g. r/personalfinance) — that gets accounts banned. The ONLY Reddit actions allowed are one-time launch/showcase POSTS in maker/showcase subreddits that welcome self-promotion, such as r/indiedev, r/SideProject, r/roastmyapp, r/alphaandbetausers, r/iosapps, r/apphookup.\n\nProduce a JSON array of 12 to 20 action items mixing one-time launch actions and recurring ongoing actions. Each item:\n{"platform":"X | Instagram | TikTok | Medium | Product Hunt | Reddit | Email | Text Message | LinkedIn | Hacker News | Facebook | etc.","type":"one-time" or "recurring","title":"short imperative title","dueInDays":integer days from today to do it,"recurrenceInterval":integer days between repeats (only for recurring, otherwise null),"impactWeight":1-5 expected conversion impact for THIS audience,"rationale":"one short line on why this matters"}\n\nSpread one-time launch items across the first few weeks (dueInDays 0-30). Give recurring items a small first dueInDays (0-7). Never use em dashes. Output ONLY the JSON array.';
+
+export async function generatePlan(campaign) {
+  var ctx = (campaign.context || '').slice(0, 4000);
+  var market = campaign.market || {};
+  var prompt = 'Product: ' + campaign.name + '\nMarket grade: ' + (market.grade || 'n/a') + '\n\nContext:\n' + ctx;
+  var raw = await callGemini(prompt, PLAN_SYSTEM, 'plan-generate');
+  var arr = extractJSON(raw);
+  return Array.isArray(arr) ? arr : [];
+}
+
+// ── Per-action content (generated lazily when the user opens an item) ──
+var CONTENT_SYSTEM = 'You write ready-to-post marketing content. Given a product context and one action (its platform and title), write the content for that platform in the founder\'s authentic voice, matching the platform\'s format and conventions. Be genuine, never generic or salesy. Never use em dashes.\n\nReturn JSON: {"body":"the main text, ready to post","fields":[{"label":"...","value":"..."}]} where fields holds every extra platform-specific piece the user needs (for example: hashtags, tagline, subject line, article title, topics, video concept, suggested image description). Include everything that platform requires so the user can copy and paste it all. Output ONLY the JSON object.';
+
+// Object-only JSON extraction (extractJSON grabs the first array, which breaks
+// objects that contain a "fields" array).
+function extractJSONObject(text) {
+  var s = text.replace(/```json|```/g, '');
+  var depth = 0, start = -1;
+  for (var i = 0; i < s.length; i++) {
+    if (s[i] === '{') { if (!depth) start = i; depth++; }
+    if (s[i] === '}') { depth--; if (!depth && start >= 0) return JSON.parse(s.slice(start, i + 1)); }
+  }
+  throw new Error('No JSON object found in AI response');
+}
+
+export async function generateActionContent(campaign, item) {
+  var ctx = (campaign.context || '').slice(0, 3000);
+  var prompt = 'Platform: ' + item.platform + '\nAction: ' + item.title
+    + '\n\nProduct context:\n' + ctx
+    + (campaign.toneExamples ? '\n\nFounder tone examples (match this voice):\n' + campaign.toneExamples.slice(0, 800) : '');
+  var raw = await callGemini(prompt, CONTENT_SYSTEM, 'action-content');
+  var obj = extractJSONObject(raw);
+  if (obj && (typeof obj.body === 'string' || Array.isArray(obj.fields))) {
+    return { body: obj.body || '', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+  }
+  // Fallback: model returned platform-specific top-level keys — render as fields.
+  var fields = Object.keys(obj || {}).map(function (k) {
+    var v = obj[k];
+    if (Array.isArray(v)) v = v.join(', ');
+    else if (v && typeof v === 'object') v = JSON.stringify(v);
+    return { label: k, value: String(v) };
+  });
+  return { body: '', fields: fields };
+}
 
 export async function aiScorePosts(posts, campaignContext) {
   if (!posts.length) return [];

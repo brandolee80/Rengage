@@ -4,10 +4,12 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import useTheme from './useTheme';
 import store from './store';
 import { loadUsername, saveUsername, getUsername, fetchSubredditPosts, searchSubredditPosts, loadPostLog, logPost, getPostFrequencyWarning, checkFollowUps, fetchInboxReplies } from './reddit';
-import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts } from './ai';
+import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts, generatePlan, generateActionContent } from './ai';
 import { scorePost, AI_SCORE_MIN_LOCAL } from './scoring';
+import { newId } from './marketing';
 import CampaignsList from './CampaignsList';
-import CampaignSetup from './CampaignSetup';
+import ActionsScreen from './ActionsScreen';
+import CampaignOnboarding from './CampaignOnboarding';
 import ResultsScreen from './ResultsScreen';
 import FollowUpsScreen from './FollowUpsScreen';
 import SettingsScreen from './SettingsScreen';
@@ -32,6 +34,8 @@ export default function App() {
   var [purgeDays, setPurgeDays] = useState(DEFAULT_PURGE_DAYS);
   var [repollMinutes, setRepollMinutes] = useState(60);
   var [inboxUrl, setInboxUrl] = useState('');
+  var [rengageCooldownMins, setRengageCooldownMins] = useState(5);
+  var [lastRengageAt, setLastRengageAt] = useState(0);
   var [loaded, setLoaded] = useState(false);
 
   useEffect(function () {
@@ -42,7 +46,13 @@ export default function App() {
       var key = await loadApiKey();
       setApiKey(key || '');
       var c = await store.get('rengage-campaigns');
-      if (c) setCampaigns(c);
+      if (c) {
+        // Migration: ensure every campaign has a stable id for marketing data.
+        var migrated = false;
+        c.forEach(function (camp) { if (!camp.id) { camp.id = newId(); migrated = true; } });
+        setCampaigns(c);
+        if (migrated) store.set('rengage-campaigns', c);
+      }
       var log = await store.get('rengage-commentlog');
       if (log) setCommentLog(log);
       var skip = await store.get('rengage-skippedlog');
@@ -57,6 +67,10 @@ export default function App() {
       if (rm) setRepollMinutes(rm);
       var iu = await store.get('rengage-inbox-url');
       if (iu) setInboxUrl(iu);
+      var cd = await store.get('rengage-cooldownmins');
+      if (typeof cd === 'number') setRengageCooldownMins(cd);
+      var lr = await store.get('rengage-lastrengage');
+      if (lr) setLastRengageAt(lr);
       setLoaded(true);
     })();
   }, []);
@@ -112,7 +126,20 @@ export default function App() {
     await store.set('rengage-savedposts', posts);
   }, []);
 
-  function handleCreateCampaign() { setScreen('newCampaign'); }
+  function handleCreateCampaign() {
+    if (!apiKey) {
+      Alert.alert(
+        'Gemini API Key Needed',
+        'Campaign setup uses AI to build your context, keywords, and market grade. Add your Gemini API key in Settings first.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open Settings', onPress: function () { setTab('settings'); } },
+        ]
+      );
+      return;
+    }
+    setScreen('newCampaign');
+  }
 
   function handleEditCampaign(idx) {
     setEditIndex(idx);
@@ -226,8 +253,11 @@ export default function App() {
 
     var next = campaigns.slice();
     if (isEdit) {
+      // Preserve the stable id (the setup form rebuilds the object without it).
+      campaign.id = (oldCampaign && oldCampaign.id) || newId();
       next[editIndex] = campaign;
     } else {
+      campaign.id = campaign.id || newId();
       next.push(campaign);
     }
     saveCampaigns(next);
@@ -286,6 +316,19 @@ export default function App() {
     await store.set('rengage-inbox-url', url);
   }
 
+  // Started whenever the user posts a Reddit comment — disables all Rengage
+  // buttons for the cooldown window so rapid-fire commenting can't look botlike.
+  async function handleRengaged() {
+    var now = Date.now();
+    setLastRengageAt(now);
+    await store.set('rengage-lastrengage', now);
+  }
+
+  async function handleSaveCooldownMins(mins) {
+    setRengageCooldownMins(mins);
+    await store.set('rengage-cooldownmins', mins);
+  }
+
   if (!loaded) {
     return (
       <View style={{ flex: 1, backgroundColor: colors.bg, justifyContent: 'center', alignItems: 'center' }}>
@@ -299,7 +342,7 @@ export default function App() {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: colors.bg }}>
         <StatusBar barStyle={theme.isDark ? 'light-content' : 'dark-content'} />
-        <CampaignSetup
+        <CampaignOnboarding
           colors={colors}
           onSave={handleSaveCampaign}
           onCancel={handleCancelSetup}
@@ -332,6 +375,9 @@ export default function App() {
         onLogPost={handleLogPost}
         purgeDays={purgeDays}
         repollMinutes={repollMinutes}
+        onRengaged={handleRengaged}
+        rengageCooldownMins={rengageCooldownMins}
+        lastRengageAt={lastRengageAt}
       />
     );
   } else if (tab === 'followups') {
@@ -348,6 +394,17 @@ export default function App() {
         onLogPost={handleLogPost}
         getFrequencyWarning={getPostFrequencyWarning}
         onCountUpdate={setFollowUpCount}
+        onRengaged={handleRengaged}
+        rengageCooldownMins={rengageCooldownMins}
+        lastRengageAt={lastRengageAt}
+      />
+    );
+  } else if (tab === 'actions') {
+    content = (
+      <ActionsScreen
+        colors={colors}
+        campaigns={campaigns}
+        generateActionContent={generateActionContent}
       />
     );
   } else if (tab === 'campaigns') {
@@ -360,6 +417,7 @@ export default function App() {
         onEdit={handleEditCampaign}
         onDelete={handleDeleteCampaign}
         onCreate={handleCreateCampaign}
+        generatePlan={generatePlan}
       />
     );
   } else if (tab === 'settings') {
@@ -379,6 +437,8 @@ export default function App() {
         onSaveRepollMinutes={handleSaveRepollMinutes}
         inboxUrl={inboxUrl}
         onSaveInboxUrl={handleSaveInboxUrl}
+        rengageCooldownMins={rengageCooldownMins}
+        onSaveCooldownMins={handleSaveCooldownMins}
       />
     );
   }
@@ -386,6 +446,7 @@ export default function App() {
   var tabItems = [
     { key: 'results', label: 'Results', icon: 'search', iconActive: 'search' },
     { key: 'followups', label: 'Follow-Ups', icon: 'chatbubble-ellipses-outline', iconActive: 'chatbubble-ellipses' },
+    { key: 'actions', label: 'Actions', icon: 'checkmark-circle-outline', iconActive: 'checkmark-circle' },
     { key: 'campaigns', label: 'Campaigns', icon: 'layers-outline', iconActive: 'layers' },
     { key: 'settings', label: 'Settings', icon: 'settings-outline', iconActive: 'settings' },
   ];

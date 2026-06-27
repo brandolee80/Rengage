@@ -37,8 +37,15 @@ export default function ResultsScreen({
   colors, campaigns, commentLog, skippedLog, onCommented, onSkipped,
   savedPosts, onSavePosts, fetchPosts, searchPosts, generateReplies, aiScorePosts,
   username, getFrequencyWarning, onLogPost, purgeDays, repollMinutes,
+  onRengaged, rengageCooldownMins, lastRengageAt,
 }) {
   var repollMs = (repollMinutes > 0 ? repollMinutes : DEFAULT_REPOLL_MIN) * 60000;
+
+  // Reddit engagement cooldown (shared app-wide): block rapid-fire commenting.
+  var rengageUntil = (lastRengageAt || 0) + (rengageCooldownMins || 0) * 60000;
+  var rengageRemainingMs = rengageUntil - Date.now();
+  var rengageActive = rengageRemainingMs > 0;
+  var rengageRemainingMin = Math.ceil(rengageRemainingMs / 60000);
   var [error, setError] = useState(null);
   var [expanded, setExpanded] = useState(null);
   var [replies, setReplies] = useState({});
@@ -356,7 +363,7 @@ export default function ResultsScreen({
   // Polling runs off refs, so it works without re-rendering; we only nudge a
   // re-render to keep "last polled"/cooldown labels live when they're visible.
   tickFnRef.current = function () {
-    if (showSources || activeSub || scoringActive || cooldownUntil > Date.now()) {
+    if (showSources || activeSub || scoringActive || rengageActive || cooldownUntil > Date.now()) {
       setTick(function (t) { return (t + 1) % 1000000; });
     }
     var now = Date.now();
@@ -438,6 +445,7 @@ export default function ResultsScreen({
       text: replyText,
     });
     Linking.openURL(post.url);
+    if (onRengaged) onRengaged();
     Alert.alert('Reply Copied', 'Paste your reply in Reddit.');
   }
 
@@ -623,6 +631,11 @@ export default function ResultsScreen({
           Reddit rate-limited us. Polling paused ~{Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000))}m.
         </Text>
       ) : null}
+      {rengageActive ? (
+        <Text style={{ color: colors.accent, fontSize: 11, paddingHorizontal: 20, marginBottom: 6 }}>
+          Rengage cooldown: ~{rengageRemainingMin}m before your next comment (avoids looking like a bot).
+        </Text>
+      ) : null}
       {error ? <Text style={{ color: colors.red, fontSize: 12, paddingHorizontal: 20, marginBottom: 6 }}>{error}</Text> : null}
 
       <ScrollView
@@ -754,13 +767,15 @@ export default function ResultsScreen({
                         />
                         <TouchableOpacity
                           onPress={function () { handleComment(post, r.text); }}
+                          disabled={rengageActive}
                           style={{
                             marginTop: 8, padding: 10, borderRadius: 6, alignItems: 'center',
-                            backgroundColor: isRec ? colors.green : colors.card2,
+                            backgroundColor: rengageActive ? colors.card2 : (isRec ? colors.green : colors.card2),
+                            opacity: rengageActive ? 0.6 : 1,
                           }}
                         >
-                          <Text style={{ color: isRec ? '#000' : colors.text, fontWeight: '600', fontSize: 13 }}>
-                            Rengage
+                          <Text style={{ color: rengageActive ? colors.textMuted : (isRec ? '#000' : colors.text), fontWeight: '600', fontSize: 13 }}>
+                            {rengageActive ? 'Cooldown · ' + rengageRemainingMin + 'm' : 'Rengage'}
                           </Text>
                         </TouchableOpacity>
                       </View>
