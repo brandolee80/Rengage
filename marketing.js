@@ -158,6 +158,86 @@ export function effortColor(score, colors) {
   return colors.red;
 }
 
+// ── Effort + results on one weekly grid (reconstructed from stored dates) ──
+// No snapshots needed: action items carry due/completed dates + weight, and
+// metric entries carry their range totals, so we can replay both onto the same
+// weekly buckets — the only way effort and results are time-scale comparable.
+// Each week reports two framings so the chart can switch between them:
+//   RATE   (effortDoneWeek, downloadsWeek, viewsWeek, cvrWeek) — activity *in*
+//          that week. Can rise and fall, so it reveals cause/effect.
+//   TOTALS (effortCumulative, downloadsCum, viewsCum, cvrCum) — running totals.
+//          Always climb, so they show progress, not correlation.
+function mStart(e) { return e.periodStart || e.date; }
+function mEnd(e) { return e.periodEnd || e.date; }
+function mDays(e) {
+  if (e.periodStart && e.periodEnd) return Math.max(1, Math.round((new Date(e.periodEnd) - new Date(e.periodStart)) / DAY_MS) + 1);
+  return 1;
+}
+function mPerDay(e, field) { return typeof e[field] === 'number' ? e[field] / mDays(e) : null; }
+// Whole days of an entry's [start,end] range that fall inside [wStart, wEnd).
+function overlapDays(eStartStr, eEndStr, wStartMs, wEndMs) {
+  var es = startOfDay(eStartStr).getTime();
+  var ee = startOfDay(eEndStr).getTime() + DAY_MS; // entry covers through its end day
+  var lo = Math.max(es, wStartMs);
+  var hi = Math.min(ee, wEndMs);
+  if (hi <= lo) return 0;
+  return Math.round((hi - lo) / DAY_MS);
+}
+
+export function weeklySeries(items, entries) {
+  var live = (items || []).filter(function (it) { return itemStatus(it) !== 'removed' && it.dueDate; });
+  entries = entries || [];
+  var times = [];
+  live.forEach(function (it) {
+    times.push(new Date(it.dueDate).getTime());
+    if (it.completedDate) times.push(new Date(it.completedDate).getTime());
+  });
+  entries.forEach(function (e) {
+    times.push(new Date(mStart(e)).getTime());
+    times.push(new Date(mEnd(e)).getTime());
+  });
+  if (times.length === 0) return [];
+  var WEEK = 7 * DAY_MS;
+  var start = startOfDay(Math.min.apply(null, times)).getTime();
+  var now = Date.now();
+  var totalWeight = live.reduce(function (s, it) { return s + (it.impactWeight || 1); }, 0) || 1;
+  var cumDl = 0, cumPv = 0, anyDl = false, anyPv = false;
+  var out = [];
+  for (var weekEnd = start + WEEK; weekEnd <= now + WEEK; weekEnd += WEEK) {
+    var weekStart = weekEnd - WEEK;
+    var cumWork = 0, doneWeek = 0;
+    live.forEach(function (it) {
+      var w = it.impactWeight || 1;
+      var comp = it.completedDate ? new Date(it.completedDate).getTime() : null;
+      if (comp == null) return;
+      var credit = w * (completedOnTime(it) ? 1.0 : 0.5);
+      if (comp <= weekEnd) cumWork += credit;
+      if (comp >= weekStart && comp < weekEnd) doneWeek += credit;
+    });
+    var wDl = 0, wPv = 0, hasDl = false, hasPv = false;
+    entries.forEach(function (e) {
+      var ov = overlapDays(mStart(e), mEnd(e), weekStart, weekEnd);
+      if (ov <= 0) return;
+      var d = mPerDay(e, 'downloads'); if (d != null) { wDl += d * ov; hasDl = true; }
+      var p = mPerDay(e, 'pageViews'); if (p != null) { wPv += p * ov; hasPv = true; }
+    });
+    if (hasDl) { cumDl += wDl; anyDl = true; }
+    if (hasPv) { cumPv += wPv; anyPv = true; }
+    out.push({
+      date: new Date(Math.min(weekEnd, now)).toISOString().slice(0, 10),
+      effortDoneWeek: Math.round(doneWeek * 10) / 10,
+      effortCumulative: Math.round((cumWork / totalWeight) * 100),
+      downloadsWeek: hasDl ? Math.round(wDl * 10) / 10 : null,
+      viewsWeek: hasPv ? Math.round(wPv * 10) / 10 : null,
+      cvrWeek: (hasDl && hasPv && wPv > 0) ? Math.round((wDl / wPv) * 1000) / 10 : null,
+      downloadsCum: anyDl ? Math.round(cumDl) : null,
+      viewsCum: anyPv ? Math.round(cumPv) : null,
+      cvrCum: (anyDl && anyPv && cumPv > 0) ? Math.round((cumDl / cumPv) * 1000) / 10 : null,
+    });
+  }
+  return out;
+}
+
 // ── Recurrence: next occurrence after completing a recurring item ──
 export function nextOccurrence(item, completedDate) {
   if (item.type !== 'recurring' || !item.recurrenceInterval) return null;

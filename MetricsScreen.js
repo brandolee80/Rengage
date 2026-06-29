@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, TextInput, ActivityIndicator } from 'react-native';
 import DateField from './DateField';
+import CorrelationChart from './CorrelationChart';
 
 // Entries hold range totals (ASC reports cumulative-over-a-range). Normalize to
 // per-day so periods of different lengths stay comparable on charts/trends.
@@ -16,7 +17,7 @@ function perDay(e, field) { return typeof e[field] === 'number' ? e[field] / eDa
 var DAY = 86400000;
 import {
   loadActionItems, saveActionItems, buildActionItems, loadMetrics, saveMetrics,
-  effortScore, effortColor, newId, itemStatus, campaignColor,
+  effortScore, effortColor, weeklySeries, newId, itemStatus, campaignColor,
   fetchKeywordRank, loadRankHistory, saveRankHistory,
 } from './marketing';
 
@@ -41,6 +42,8 @@ export default function MetricsScreen({ colors, campaigns, commentLog, redditWee
   var [pageViews, setPageViews] = useState('');
   var [customLabel, setCustomLabel] = useState('');
   var [customValue, setCustomValue] = useState('');
+  var [chartShow, setChartShow] = useState({ effort: true, downloads: true, pageViews: false, cvr: false });
+  var [chartMode, setChartMode] = useState('rate'); // 'rate' = per-week (correlation) | 'totals' = cumulative (progress)
 
   useEffect(function () {
     if (!selectedId && campaigns.length) setSelectedId(campaigns[0].id);
@@ -193,13 +196,31 @@ export default function MetricsScreen({ colors, campaigns, commentLog, redditWee
     .map(function (e) { return { date: eEnd(e), v: perDay(e, 'downloads') }; })
     .filter(function (p) { return p.v != null; })
     .sort(function (a, b) { return new Date(a.date) - new Date(b.date); });
-  var maxDl = dlPoints.reduce(function (m, p) { return Math.max(m, p.v); }, 0) || 1;
   var trend = (function () {
     if (dlPoints.length < 2) return { direction: 'unknown', delta: 0 };
     var last = dlPoints[dlPoints.length - 1].v, prevv = dlPoints[dlPoints.length - 2].v;
     var pct = prevv === 0 ? (last > 0 ? 1 : 0) : (last - prevv) / prevv;
     return { direction: pct > 0.05 ? 'growing' : pct < -0.05 ? 'declining' : 'flat', delta: Math.round((last - prevv) * 10) / 10 };
   })();
+
+  // Effort + results on one weekly grid (same time scale), each normalized to its
+  // own range. 'rate' = per-week activity (rises/falls → correlation); 'totals' =
+  // cumulative (always climbs → progress). effortKeep keeps 0 weeks; metrics drop
+  // null weeks (no data entered ≠ zero results).
+  var ws = weeklySeries(liveItems, entries);
+  var rate = chartMode === 'rate';
+  function effPts() { return ws.map(function (p) { return { date: p.date, value: rate ? p.effortDoneWeek : p.effortCumulative }; }); }
+  function metricPts(weekField, cumField) {
+    return ws.map(function (p) { return { date: p.date, value: rate ? p[weekField] : p[cumField] }; })
+      .filter(function (p) { return p.value != null; });
+  }
+  var chartSeries = [
+    { key: 'effort', label: rate ? 'Effort/wk' : 'Effort total', color: colors.primary, points: effPts() },
+    { key: 'downloads', label: 'Downloads', color: colors.green, points: metricPts('downloadsWeek', 'downloadsCum') },
+    { key: 'pageViews', label: 'Views', color: colors.accent, points: metricPts('viewsWeek', 'viewsCum') },
+    { key: 'cvr', label: 'CVR %', color: '#8B5CF6', points: metricPts('cvrWeek', 'cvrCum') },
+  ];
+  var visibleSeries = chartSeries.filter(function (s) { return chartShow[s.key] && s.points.length > 0; });
 
   if (campaigns.length === 0) {
     return (
@@ -302,22 +323,43 @@ export default function MetricsScreen({ colors, campaigns, commentLog, redditWee
           );
         })()}
 
-        {/* Downloads chart */}
-        {dlPoints.length > 0 ? (
-          <View style={{ backgroundColor: colors.card, borderRadius: 10, borderWidth: 1, borderColor: colors.border, padding: 14, marginBottom: 12 }}>
-            <Text style={{ color: colors.textMuted, fontSize: 11, fontWeight: '600', marginBottom: 10 }}>DOWNLOADS / DAY</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'flex-end', height: 100, gap: 4 }}>
-              {dlPoints.slice(-14).map(function (p, i) {
+        {/* Effort vs results correlation */}
+        <View style={{ backgroundColor: colors.card, borderRadius: 10, borderWidth: 1, borderColor: colors.border, padding: 14, marginBottom: 12 }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <Text style={{ color: colors.textMuted, fontSize: 11, fontWeight: '600' }}>EFFORT vs RESULTS</Text>
+            <View style={{ flexDirection: 'row', backgroundColor: colors.card2, borderRadius: 7, padding: 2 }}>
+              {[['rate', 'Rate'], ['totals', 'Totals']].map(function (m) {
+                var on = chartMode === m[0];
                 return (
-                  <View key={i} style={{ flex: 1, alignItems: 'center' }}>
-                    <View style={{ width: '70%', height: Math.max(2, (p.v / maxDl) * 90), backgroundColor: colors.primary, borderRadius: 2 }} />
-                    <Text style={{ color: colors.textMuted, fontSize: 8, marginTop: 3 }}>{p.date.slice(5)}</Text>
-                  </View>
+                  <TouchableOpacity key={m[0]} onPress={function () { setChartMode(m[0]); }}
+                    style={{ paddingHorizontal: 11, paddingVertical: 4, borderRadius: 5, backgroundColor: on ? colors.primary : 'transparent' }}>
+                    <Text style={{ color: on ? '#fff' : colors.textMuted, fontSize: 11, fontWeight: '600' }}>{m[1]}</Text>
+                  </TouchableOpacity>
                 );
               })}
             </View>
           </View>
-        ) : null}
+          <Text style={{ color: colors.textMuted, fontSize: 10, marginBottom: 10, lineHeight: 14 }}>
+            {rate
+              ? 'Per week, on one weekly grid. Each line is scaled to its own range — watch whether results rise the weeks you put in work.'
+              : 'Running totals — both effort and results only climb, so this shows how far you have come, not cause and effect.'}
+          </Text>
+          <CorrelationChart colors={colors} series={visibleSeries} height={150} />
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+            {chartSeries.map(function (s) {
+              var on = chartShow[s.key];
+              var has = s.points.length > 0;
+              return (
+                <TouchableOpacity key={s.key} disabled={!has}
+                  onPress={function () { setChartShow(Object.assign({}, chartShow, (function () { var o = {}; o[s.key] = !on; return o; })())); }}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 5, opacity: has ? 1 : 0.35, paddingVertical: 3, paddingHorizontal: 8, borderRadius: 14, backgroundColor: on && has ? colors.card2 : 'transparent', borderWidth: 1, borderColor: on && has ? s.color : colors.border }}>
+                  <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: on && has ? s.color : colors.textMuted }} />
+                  <Text style={{ color: on && has ? colors.text : colors.textMuted, fontSize: 11, fontWeight: '600' }}>{s.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
 
         {/* Keyword ranks (ASO, iOS) */}
         {(function () {
