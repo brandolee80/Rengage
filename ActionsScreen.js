@@ -4,9 +4,10 @@ import {
 } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
 import Ionicons from '@expo/vector-icons/Ionicons';
+import DateField from './DateField';
 import {
   loadActionItems, saveActionItems, itemStatus, isDueThisWeekOrOverdue,
-  nextOccurrence, campaignColor,
+  nextOccurrence, campaignColor, startByDate,
 } from './marketing';
 
 var PLATFORM_HOME = {
@@ -30,7 +31,7 @@ export default function ActionsScreen({ colors, campaigns, generateActionContent
   var [error, setError] = useState(null);
   var [copied, setCopied] = useState('');
   var [completingId, setCompletingId] = useState(null);
-  var [dateInput, setDateInput] = useState('');
+  var [completeDate, setCompleteDate] = useState(new Date());
 
   // Map campaignId -> color (assigned by creation order).
   var colorOf = {};
@@ -140,14 +141,18 @@ export default function ActionsScreen({ colors, campaigns, generateActionContent
     var sa = itemStatus(a), sb = itemStatus(b);
     if (sa === 'overdue' && sb !== 'overdue') return -1;
     if (sb === 'overdue' && sa !== 'overdue') return 1;
-    return new Date(a.dueDate) - new Date(b.dueDate);
+    var da = new Date(a.dueDate).setHours(0, 0, 0, 0);
+    var db = new Date(b.dueDate).setHours(0, 0, 0, 0);
+    if (da !== db) return da - db;
+    // Same day: best bang for buck first (high impact, low effort).
+    var ra = (a.impactWeight || 1) / (a.effort || 1);
+    var rb = (b.impactWeight || 1) / (b.effort || 1);
+    return rb - ra;
   });
 
-  function flames(n) {
-    var s = '';
-    for (var i = 0; i < (n || 0); i++) s += '🔥';
-    return s;
-  }
+  var PHASE = { 1: 'Pre-Launch', 2: 'Launch', 3: 'Post-Launch' };
+  function impactColor(n) { return n >= 4 ? colors.green : n === 3 ? colors.accent : colors.textMuted; }
+  function effortColorN(n) { return n >= 4 ? colors.red : n === 3 ? colors.accent : colors.green; }
   function dueLabel(it) {
     var st = itemStatus(it);
     if (st === 'completed') return 'Done ' + new Date(it.completedDate).toLocaleDateString();
@@ -196,16 +201,30 @@ export default function ActionsScreen({ colors, campaigns, generateActionContent
               <TouchableOpacity onPress={function () { handleExpand(item); }} activeOpacity={0.7} style={{ padding: 14 }}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                   <Text style={{ color: colors.text, fontSize: 14, fontWeight: '500', flex: 1, lineHeight: 19 }}>{item.title}</Text>
-                  <Text style={{ fontSize: 11 }}>{flames(item.impactWeight)}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    {item.paid ? <Text style={{ color: colors.accent, fontSize: 13, fontWeight: '800' }}>$</Text> : null}
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={{ color: impactColor(item.impactWeight || 3), fontSize: 13, fontWeight: '800' }}>{item.impactWeight || 3}</Text>
+                      <Text style={{ color: colors.textMuted, fontSize: 7 }}>IMP</Text>
+                    </View>
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={{ color: effortColorN(item.effort || 3), fontSize: 13, fontWeight: '800' }}>{item.effort || 3}</Text>
+                      <Text style={{ color: colors.textMuted, fontSize: 7 }}>EFF</Text>
+                    </View>
+                  </View>
                 </View>
                 <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6, alignItems: 'center' }}>
                   <View style={{ backgroundColor: color, borderRadius: 4, paddingHorizontal: 6, paddingVertical: 1 }}>
                     <Text style={{ color: '#fff', fontSize: 10, fontWeight: '700' }}>{item.campaignName}</Text>
                   </View>
+                  {item.phase ? <Text style={{ color: colors.textSecondary, fontSize: 10, fontWeight: '600' }}>{PHASE[item.phase]}</Text> : null}
                   <Text style={{ color: colors.primary, fontSize: 11 }}>{item.platform}</Text>
                   <Text style={{ color: st === 'overdue' ? colors.red : colors.textMuted, fontSize: 11 }}>{dueLabel(item)}</Text>
                   {item.type === 'recurring' ? <Text style={{ color: colors.textMuted, fontSize: 11 }}>↻ every {item.recurrenceInterval}d</Text> : null}
                 </View>
+                {st !== 'completed' && startByDate(item) ? (
+                  <Text style={{ color: colors.accent, fontSize: 11, marginTop: 5 }}>Start by {startByDate(item).toLocaleDateString()} (needs prep)</Text>
+                ) : null}
                 {item.rationale && !isOpen ? <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 5, fontStyle: 'italic' }}>{item.rationale}</Text> : null}
               </TouchableOpacity>
 
@@ -253,18 +272,16 @@ export default function ActionsScreen({ colors, campaigns, generateActionContent
 
                   {completingId === item.id ? (
                     <View style={{ marginTop: 10 }}>
-                      <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 4 }}>Completed on (YYYY-MM-DD):</Text>
-                      <TextInput
-                        style={{ backgroundColor: colors.inputBg, borderColor: colors.inputBorder, borderWidth: 1, borderRadius: 8, padding: 10, fontSize: 14, color: colors.text }}
-                        value={dateInput} onChangeText={setDateInput} placeholder="2026-06-01" placeholderTextColor={colors.textMuted}
-                        autoCapitalize="none" autoCorrect={false}
-                      />
-                      <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                        <Text style={{ color: colors.textMuted, fontSize: 12 }}>Completed on:</Text>
+                        <DateField colors={colors} value={completeDate} maximumDate={new Date()} onChange={setCompleteDate} />
+                      </View>
+                      <View style={{ flexDirection: 'row', gap: 8 }}>
                         <TouchableOpacity onPress={function () { setCompletingId(null); }}
                           style={{ flex: 1, padding: 10, borderRadius: 6, alignItems: 'center', backgroundColor: colors.card2 }}>
                           <Text style={{ color: colors.textMuted, fontSize: 13 }}>Cancel</Text>
                         </TouchableOpacity>
-                        <TouchableOpacity onPress={function () { handleComplete(item, dateInput); }}
+                        <TouchableOpacity onPress={function () { handleComplete(item, completeDate.toISOString()); }}
                           style={{ flex: 1, padding: 10, borderRadius: 6, alignItems: 'center', backgroundColor: colors.green }}>
                           <Text style={{ color: '#000', fontWeight: '600', fontSize: 13 }}>Confirm</Text>
                         </TouchableOpacity>
@@ -273,12 +290,12 @@ export default function ActionsScreen({ colors, campaigns, generateActionContent
                   ) : (
                     <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
                       {st !== 'completed' ? (
-                        <TouchableOpacity onPress={function () { setDateInput(new Date().toISOString().slice(0, 10)); setCompletingId(item.id); }}
+                        <TouchableOpacity onPress={function () { setCompleteDate(new Date()); setCompletingId(item.id); }}
                           style={{ flex: 1, padding: 10, borderRadius: 6, alignItems: 'center', backgroundColor: colors.green }}>
                           <Text style={{ color: '#000', fontWeight: '600', fontSize: 13 }}>Mark Complete</Text>
                         </TouchableOpacity>
                       ) : (
-                        <TouchableOpacity onPress={function () { setDateInput((item.completedDate || '').slice(0, 10)); setCompletingId(item.id); }}
+                        <TouchableOpacity onPress={function () { setCompleteDate(item.completedDate ? new Date(item.completedDate) : new Date()); setCompletingId(item.id); }}
                           style={{ flex: 1, padding: 10, borderRadius: 6, alignItems: 'center', backgroundColor: colors.card2 }}>
                           <Text style={{ color: colors.textSecondary, fontSize: 13 }}>Edit Date</Text>
                         </TouchableOpacity>

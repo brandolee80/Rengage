@@ -4,11 +4,12 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import useTheme from './useTheme';
 import store from './store';
 import { loadUsername, saveUsername, getUsername, fetchSubredditPosts, searchSubredditPosts, loadPostLog, logPost, getPostFrequencyWarning, checkFollowUps, fetchInboxReplies } from './reddit';
-import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts, generatePlan, generateActionContent } from './ai';
+import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts, generatePlan, generateActionContent, generateBoost } from './ai';
 import { scorePost, AI_SCORE_MIN_LOCAL } from './scoring';
 import { newId } from './marketing';
 import CampaignsList from './CampaignsList';
 import ActionsScreen from './ActionsScreen';
+import MetricsScreen from './MetricsScreen';
 import CampaignOnboarding from './CampaignOnboarding';
 import ResultsScreen from './ResultsScreen';
 import FollowUpsScreen from './FollowUpsScreen';
@@ -21,7 +22,13 @@ export default function App() {
   var colors = theme.colors;
 
   var [tab, setTab] = useState('results');
+  var [section, setSection] = useState('reddit'); // 'reddit' | 'marketing'
   var [screen, setScreen] = useState(null);
+
+  function switchSection(s) {
+    setSection(s);
+    setTab(s === 'marketing' ? 'actions' : 'results');
+  }
   var [campaigns, setCampaigns] = useState([]);
   var [commentLog, setCommentLog] = useState({});
   var [skippedLog, setSkippedLog] = useState({});
@@ -36,6 +43,7 @@ export default function App() {
   var [inboxUrl, setInboxUrl] = useState('');
   var [rengageCooldownMins, setRengageCooldownMins] = useState(5);
   var [lastRengageAt, setLastRengageAt] = useState(0);
+  var [redditWeeklyTarget, setRedditWeeklyTarget] = useState(5);
   var [loaded, setLoaded] = useState(false);
 
   useEffect(function () {
@@ -71,6 +79,8 @@ export default function App() {
       if (typeof cd === 'number') setRengageCooldownMins(cd);
       var lr = await store.get('rengage-lastrengage');
       if (lr) setLastRengageAt(lr);
+      var rwt = await store.get('rengage-reddit-weekly');
+      if (typeof rwt === 'number') setRedditWeeklyTarget(rwt);
       setLoaded(true);
     })();
   }, []);
@@ -329,6 +339,11 @@ export default function App() {
     await store.set('rengage-cooldownmins', mins);
   }
 
+  async function handleSaveRedditWeekly(n) {
+    setRedditWeeklyTarget(n);
+    await store.set('rengage-reddit-weekly', n);
+  }
+
   if (!loaded) {
     return (
       <View style={{ flex: 1, backgroundColor: colors.bg, justifyContent: 'center', alignItems: 'center' }}>
@@ -407,13 +422,17 @@ export default function App() {
         generateActionContent={generateActionContent}
       />
     );
+  } else if (tab === 'metrics') {
+    content = (
+      <MetricsScreen colors={colors} campaigns={campaigns} commentLog={commentLog} redditWeeklyTarget={redditWeeklyTarget} generateBoost={generateBoost} />
+    );
   } else if (tab === 'campaigns') {
     content = (
       <CampaignsList
         colors={colors}
         campaigns={campaigns}
         commentLog={commentLog}
-        onSelect={function () { setTab('results'); }}
+        onSelect={function () { switchSection('reddit'); }}
         onEdit={handleEditCampaign}
         onDelete={handleDeleteCampaign}
         onCreate={handleCreateCampaign}
@@ -424,6 +443,7 @@ export default function App() {
     content = (
       <SettingsScreen
         colors={colors}
+        campaigns={campaigns}
         isDark={theme.isDark}
         toggleTheme={theme.toggle}
         username={username}
@@ -439,21 +459,40 @@ export default function App() {
         onSaveInboxUrl={handleSaveInboxUrl}
         rengageCooldownMins={rengageCooldownMins}
         onSaveCooldownMins={handleSaveCooldownMins}
+        redditWeeklyTarget={redditWeeklyTarget}
+        onSaveRedditWeekly={handleSaveRedditWeekly}
       />
     );
   }
 
-  var tabItems = [
-    { key: 'results', label: 'Results', icon: 'search', iconActive: 'search' },
-    { key: 'followups', label: 'Follow-Ups', icon: 'chatbubble-ellipses-outline', iconActive: 'chatbubble-ellipses' },
-    { key: 'actions', label: 'Actions', icon: 'checkmark-circle-outline', iconActive: 'checkmark-circle' },
+  var sectionTabs = section === 'marketing'
+    ? [
+        { key: 'actions', label: 'Actions', icon: 'checkmark-circle-outline', iconActive: 'checkmark-circle' },
+        { key: 'metrics', label: 'Metrics', icon: 'bar-chart-outline', iconActive: 'bar-chart' },
+      ]
+    : [
+        { key: 'results', label: 'Results', icon: 'search', iconActive: 'search' },
+        { key: 'followups', label: 'Follow-Ups', icon: 'chatbubble-ellipses-outline', iconActive: 'chatbubble-ellipses' },
+      ];
+  var tabItems = sectionTabs.concat([
     { key: 'campaigns', label: 'Campaigns', icon: 'layers-outline', iconActive: 'layers' },
     { key: 'settings', label: 'Settings', icon: 'settings-outline', iconActive: 'settings' },
-  ];
+  ]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: colors.bg }}>
       <StatusBar barStyle={theme.isDark ? 'light-content' : 'dark-content'} />
+      <View style={{ flexDirection: 'row', backgroundColor: colors.card2, marginHorizontal: 12, marginTop: 10, borderRadius: 8, padding: 3 }}>
+        {[{ k: 'reddit', l: 'Reddit' }, { k: 'marketing', l: 'Marketing' }].map(function (s) {
+          var active = section === s.k;
+          return (
+            <TouchableOpacity key={s.k} onPress={function () { switchSection(s.k); }}
+              style={{ flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 6, backgroundColor: active ? colors.card : 'transparent' }}>
+              <Text style={{ color: active ? colors.text : colors.textMuted, fontSize: 13, fontWeight: active ? '700' : '500' }}>{s.l}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
       <View style={{ flex: 1 }}>{content}</View>
       <View style={{
         flexDirection: 'row', backgroundColor: colors.card,

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView,
-  ActivityIndicator, KeyboardAvoidingView, Platform,
+  ActivityIndicator, KeyboardAvoidingView, Platform, Switch,
 } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as Clipboard from 'expo-clipboard';
@@ -59,6 +59,7 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
   var [appStoreId, setAppStoreId] = useState(isEdit ? (existingCampaign.appStoreId || '') : '');
   var [playPackage, setPlayPackage] = useState(isEdit ? (existingCampaign.playPackage || '') : '');
   var [toneExamples, setToneExamples] = useState(isEdit ? (existingCampaign.toneExamples || '') : '');
+  var [includePaid, setIncludePaid] = useState(isEdit ? !!existingCampaign.includePaid : false);
   var [marketGrade, setMarketGrade] = useState(isEdit ? ((existingCampaign.market && existingCampaign.market.grade) || '') : '');
   var [marketReasoning, setMarketReasoning] = useState(isEdit ? ((existingCampaign.market && existingCampaign.market.reasoning) || '') : '');
   var [previews, setPreviews] = useState(null);
@@ -378,6 +379,7 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
       appStoreId: appStoreId.trim(),
       playPackage: playPackage.trim(),
       toneExamples: toneExamples,
+      includePaid: includePaid,
       answers: answers,
       market: {
         answers: marketAnswers,
@@ -684,6 +686,14 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
         {field('App Store ID', 'Numeric id from your App Store URL (for iOS rank tracking)', appStoreId, setAppStoreId, { placeholder: 'e.g. 1234567890', autoCap: 'none', autoCorrect: false })}
         {field('Play Package Name', 'Android package (for later Android rank tracking)', playPackage, setPlayPackage, { placeholder: 'com.sheffco.myapp', autoCap: 'none', autoCorrect: false })}
         {field('Your Tone Examples', 'Paste real comments/posts you\'ve written so the AI matches your voice', toneExamples, setToneExamples, { tall: true, placeholder: 'Paste a few things you\'ve actually written...' })}
+
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: colors.card, borderRadius: 10, borderWidth: 1, borderColor: colors.border, padding: 14, marginBottom: 16 }}>
+          <View style={{ flex: 1, paddingRight: 10 }}>
+            <Text style={{ color: colors.text, fontSize: 13, fontWeight: '600' }}>Include paid promotion</Text>
+            <Text style={{ color: colors.textMuted, fontSize: 11, marginTop: 2, lineHeight: 15 }}>Allow ads and paid influencers in the plan. Off = free / organic actions only.</Text>
+          </View>
+          <Switch value={includePaid} onValueChange={setIncludePaid} />
+        </View>
 
         <TouchableOpacity onPress={handleSave} disabled={!canSave}
           style={{ padding: 14, borderRadius: 10, alignItems: 'center', marginTop: 8, backgroundColor: canSave ? colors.primary : colors.card2 }}>

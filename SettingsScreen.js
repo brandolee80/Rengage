@@ -1,13 +1,62 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, TextInput, ScrollView, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, TextInput, ScrollView, Alert, Share } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
 import { getAiBudget, getAiConfig, setAiConfig, getUsage } from './ai';
+import { loadActionItems, loadMetrics } from './marketing';
+import store from './store';
 
-export default function SettingsScreen({ colors, isDark, toggleTheme, username, onSaveUsername, apiKey, onSaveApiKey, postLog, purgeDays, onSavePurgeDays, repollMinutes, onSaveRepollMinutes, inboxUrl, onSaveInboxUrl, rengageCooldownMins, onSaveCooldownMins }) {
+export default function SettingsScreen({ colors, campaigns, isDark, toggleTheme, username, onSaveUsername, apiKey, onSaveApiKey, postLog, purgeDays, onSavePurgeDays, repollMinutes, onSaveRepollMinutes, inboxUrl, onSaveInboxUrl, rengageCooldownMins, onSaveCooldownMins, redditWeeklyTarget, onSaveRedditWeekly }) {
   var [keyInput, setKeyInput] = useState(apiKey || '');
   var [nameInput, setNameInput] = useState(username || '');
   var [inboxInput, setInboxInput] = useState(inboxUrl || '');
   var [inboxSaved, setInboxSaved] = useState(false);
   var [cooldownInput, setCooldownInput] = useState(String(rengageCooldownMins != null ? rengageCooldownMins : 5));
+  var [redditWeeklyInput, setRedditWeeklyInput] = useState(String(redditWeeklyTarget != null ? redditWeeklyTarget : 5));
+  var [taps, setTaps] = useState(0);
+  var [devMode, setDevMode] = useState(false);
+
+  useEffect(function () { store.get('rengage-devmode').then(function (v) { if (v) setDevMode(true); }); }, []);
+
+  function tapTitle() {
+    var n = taps + 1;
+    setTaps(n);
+    if (n >= 5 && !devMode) { setDevMode(true); store.set('rengage-devmode', true); Alert.alert('Developer Mode', 'Export tools enabled.'); }
+  }
+
+  async function buildExport() {
+    var out = [];
+    for (var i = 0; i < (campaigns || []).length; i++) {
+      var c = campaigns[i];
+      var actionItems = await loadActionItems(c.id);
+      var metrics = await loadMetrics(c.id);
+      out.push({
+        name: c.name, market: c.market, includePaid: !!c.includePaid,
+        subs: c.subs, keywords: c.keywords, asoKeywords: c.asoKeywords,
+        appStoreId: c.appStoreId, context: c.context,
+        actionItems: actionItems, metrics: metrics,
+      });
+    }
+    return JSON.stringify(out, null, 2);
+  }
+
+  async function copyExport() {
+    var json = await buildExport();
+    await Clipboard.setStringAsync(json);
+    Alert.alert('Copied', 'Context + action items copied. Paste into Claude to review the plan.');
+  }
+
+  async function shareExport() {
+    var json = await buildExport();
+    try { await Share.share({ message: json }); } catch (e) {}
+  }
+
+  function handleSaveRedditWeekly() {
+    var n = parseInt(redditWeeklyInput) || 5;
+    if (n < 1) n = 1;
+    if (n > 200) n = 200;
+    setRedditWeeklyInput(String(n));
+    onSaveRedditWeekly(n);
+  }
 
   function handleSaveCooldown() {
     var m = parseInt(cooldownInput);
@@ -93,7 +142,9 @@ export default function SettingsScreen({ colors, isDark, toggleTheme, username, 
 
   return (
     <ScrollView style={{ flex: 1, backgroundColor: colors.bg, padding: 20 }}>
-      <Text style={{ color: colors.text, fontSize: 22, fontWeight: '700', marginBottom: 20 }}>Settings</Text>
+      <TouchableOpacity activeOpacity={1} onPress={tapTitle}>
+        <Text style={{ color: colors.text, fontSize: 22, fontWeight: '700', marginBottom: 20 }}>Settings</Text>
+      </TouchableOpacity>
 
       {/* Reddit Username */}
       <View style={{
@@ -329,6 +380,37 @@ export default function SettingsScreen({ colors, isDark, toggleTheme, username, 
         </View>
       </View>
 
+      {/* Reddit Engagement Goal */}
+      <View style={{
+        backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
+        borderRadius: 12, padding: 16, marginBottom: 16,
+      }}>
+        <Text style={{ color: colors.textSecondary, fontSize: 13, fontWeight: '600', marginBottom: 4 }}>Reddit Engagement Goal</Text>
+        <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 10, lineHeight: 16 }}>
+          Your weekly target for Reddit comments. Each comment counts toward this goal in your campaign's
+          Effort Score (hitting the target = full engagement credit; extra comments don't inflate it).
+        </Text>
+        <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+          <TextInput
+            style={{
+              backgroundColor: colors.inputBg, borderColor: colors.inputBorder,
+              borderWidth: 1, borderRadius: 8, padding: 10, fontSize: 14,
+              color: colors.text, width: 60, textAlign: 'center',
+            }}
+            value={redditWeeklyInput}
+            onChangeText={setRedditWeeklyInput}
+            keyboardType="number-pad"
+          />
+          <Text style={{ color: colors.textMuted, fontSize: 13 }}>comments/week</Text>
+          <TouchableOpacity
+            onPress={handleSaveRedditWeekly}
+            style={{ backgroundColor: colors.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 6 }}
+          >
+            <Text style={{ color: '#fff', fontWeight: '600', fontSize: 13 }}>Save</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
       {/* Rengage Cooldown */}
       <View style={{
         backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
@@ -414,6 +496,30 @@ export default function SettingsScreen({ colors, isDark, toggleTheme, username, 
           <Text style={{ color: colors.textSecondary, fontSize: 14 }}>{isDark ? 'On' : 'Off'}</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Developer (5-tap the title to enable) */}
+      {devMode ? (
+        <View style={{
+          backgroundColor: colors.card, borderWidth: 1, borderColor: colors.accent,
+          borderRadius: 12, padding: 16, marginBottom: 16,
+        }}>
+          <Text style={{ color: colors.accent, fontSize: 13, fontWeight: '600', marginBottom: 4 }}>Developer · Export</Text>
+          <Text style={{ color: colors.textMuted, fontSize: 11, marginBottom: 10, lineHeight: 16 }}>
+            Export all campaigns' context + action items as JSON to review plan quality (paste into Claude).
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <TouchableOpacity onPress={copyExport} style={{ flex: 1, backgroundColor: colors.primary, padding: 11, borderRadius: 8, alignItems: 'center' }}>
+              <Text style={{ color: '#fff', fontWeight: '600', fontSize: 13 }}>Copy JSON</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={shareExport} style={{ flex: 1, backgroundColor: colors.card2, padding: 11, borderRadius: 8, alignItems: 'center' }}>
+              <Text style={{ color: colors.text, fontWeight: '600', fontSize: 13 }}>Share</Text>
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity onPress={function () { setDevMode(false); setTaps(0); store.set('rengage-devmode', false); }} style={{ padding: 8, alignItems: 'center', marginTop: 6 }}>
+            <Text style={{ color: colors.textMuted, fontSize: 12 }}>Disable dev mode</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {/* About */}
       <View style={{

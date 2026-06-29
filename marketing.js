@@ -82,15 +82,19 @@ export function buildActionItems(campaign, skeleton) {
       campaignName: campaign.name,
       platform: s.platform,
       type: recurring ? 'recurring' : 'one-time',
+      phase: (s.phase === 2 || s.phase === 3) ? s.phase : 1,
       title: s.title,
       rationale: s.rationale || '',
       content: null,
       generated: false,
       dueDate: new Date(now + dueInDays * DAY_MS).toISOString(),
       dueTime: null,
+      leadTimeDays: typeof s.leadTimeDays === 'number' ? Math.max(0, s.leadTimeDays) : 0,
       completedDate: null,
       recurrenceInterval: recurring ? (s.recurrenceInterval || 7) : null,
       impactWeight: Math.max(1, Math.min(5, s.impactWeight || 3)),
+      effort: Math.max(1, Math.min(5, s.effort || 3)),
+      paid: !!s.paid,
       removed: false,
       removalReason: null,
     };
@@ -121,7 +125,10 @@ function completedOnTime(item) {
 // numerator   = sum of completed weight * (1.0 on time, 0.5 late)
 // denominator = sum of weight for items that count: completed, pending, overdue, skipped
 //               (items removed as not-relevant / different-way are excluded entirely)
-export function effortScore(items) {
+// `reddit` (optional) folds ongoing Reddit engagement in as a recurring stream:
+// { count: comments this week, target: weekly goal, weight: impact (default 4) }.
+// Its completion ratio = min(1, count/target), so each comment is worth 1/target.
+export function effortScore(items, reddit) {
   var num = 0;
   var den = 0;
   items.forEach(function (it) {
@@ -135,6 +142,11 @@ export function effortScore(items) {
       den += w; // counts against you, contributes nothing
     }
   });
+  if (reddit && reddit.target > 0) {
+    var rw = reddit.weight || 4;
+    num += rw * Math.min(1, (reddit.count || 0) / reddit.target);
+    den += rw;
+  }
   if (den === 0) return null;
   return Math.round((num / den) * 100);
 }
@@ -178,7 +190,15 @@ export function isDueThisWeekOrOverdue(item, now) {
   if (st === 'overdue') return true;
   if (!item.dueDate) return true;
   var weekEnd = startOfDay(now).getTime() + 7 * DAY_MS;
-  return startOfDay(item.dueDate).getTime() <= weekEnd;
+  // Surface high-prep items when it's time to START (due minus lead time).
+  var startBy = startOfDay(item.dueDate).getTime() - (item.leadTimeDays || 0) * DAY_MS;
+  return startBy <= weekEnd;
+}
+
+// When the user should begin a prep-heavy item (due minus lead time).
+export function startByDate(item) {
+  if (!item.dueDate || !item.leadTimeDays) return null;
+  return new Date(new Date(item.dueDate).getTime() - item.leadTimeDays * DAY_MS);
 }
 
 // ── Metrics trend (local, deterministic — no AI) ──
@@ -196,6 +216,29 @@ export function metricsTrend(entries, field) {
   if (pct > 0.05) return { direction: 'growing', label: 'growing', delta: delta };
   if (pct < -0.05) return { direction: 'declining', label: 'declining', delta: delta };
   return { direction: 'flat', label: 'flat', delta: delta };
+}
+
+// ── ASO keyword rank (free iTunes Search API; iOS) ──
+// Returns 1-based rank of the app for the keyword, or null if not in top 100.
+export async function fetchKeywordRank(keyword, appStoreId) {
+  var url = 'https://itunes.apple.com/search?term=' + encodeURIComponent(keyword) +
+    '&country=us&entity=software&limit=100';
+  var res = await fetch(url);
+  if (!res.ok) throw new Error('iTunes search failed: ' + res.status);
+  var data = await res.json();
+  var results = data.results || [];
+  for (var i = 0; i < results.length; i++) {
+    if (String(results[i].trackId) === String(appStoreId)) return i + 1;
+  }
+  return null;
+}
+
+function asoKey(campaignId) { return 'rengage-aso-' + campaignId; }
+export async function loadRankHistory(campaignId) {
+  return (await store.get(asoKey(campaignId))) || [];
+}
+export async function saveRankHistory(campaignId, history) {
+  await store.set(asoKey(campaignId), history);
 }
 
 // ── Persistence (per campaign) ──

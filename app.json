@@ -27,7 +27,9 @@
       },
       "package": "com.sheffco.rengage"
     },
-    "plugins": [],
+    "plugins": [
+      "@react-native-community/datetimepicker"
+    ],
     "extra": {
       "eas": {
         "projectId": "c8b3a95a-1329-4820-8163-2bca799f0066"
