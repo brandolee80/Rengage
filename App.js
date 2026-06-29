@@ -4,7 +4,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import useTheme from './useTheme';
 import store from './store';
 import { loadUsername, saveUsername, getUsername, fetchSubredditPosts, searchSubredditPosts, loadPostLog, logPost, getPostFrequencyWarning, checkFollowUps, fetchInboxReplies } from './reddit';
-import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts, generatePlan, generateActionContent, generateBoost } from './ai';
+import { loadApiKey, saveApiKey, hasApiKey, generateCampaignContext, generateReplies, callAI, aiScorePosts, generatePlan, generateActionContent, generateBoost, tagCampaignAssets } from './ai';
 import { scorePost, AI_SCORE_MIN_LOCAL } from './scoring';
 import { newId } from './marketing';
 import CampaignsList from './CampaignsList';
@@ -21,14 +21,9 @@ export default function App() {
   var theme = useTheme();
   var colors = theme.colors;
 
-  var [tab, setTab] = useState('results');
-  var [section, setSection] = useState('reddit'); // 'reddit' | 'marketing'
+  var [tab, setTab] = useState('campaigns');
+  var [redditView, setRedditView] = useState('results'); // 'results' | 'followups' (inside the Reddit tab)
   var [screen, setScreen] = useState(null);
-
-  function switchSection(s) {
-    setSection(s);
-    setTab(s === 'marketing' ? 'actions' : 'results');
-  }
   var [campaigns, setCampaigns] = useState([]);
   var [commentLog, setCommentLog] = useState({});
   var [skippedLog, setSkippedLog] = useState({});
@@ -278,6 +273,15 @@ export default function App() {
     if (contextDirty) rescoreCampaign(oldCampaign.name, campaign);
   }
 
+  // Merge a partial update into one campaign by id (used by the Actions screen to
+  // persist imported/captured assets and vision tags without a full edit).
+  function updateCampaign(campaignId, patch) {
+    var next = campaigns.map(function (c) {
+      return c.id === campaignId ? Object.assign({}, c, patch, { updatedAt: Date.now() }) : c;
+    });
+    saveCampaigns(next);
+  }
+
   function handleCancelSetup() {
     setScreen(null);
     setEditIndex(null);
@@ -370,8 +374,25 @@ export default function App() {
 
   // Tab content
   var content = null;
-  if (tab === 'results') {
-    content = (
+  if (tab === 'reddit') {
+    var redditScreen = redditView === 'followups' ? (
+      <FollowUpsScreen
+        colors={colors}
+        commentLog={commentLog}
+        username={username}
+        checkFollowUps={checkFollowUps}
+        fetchInboxReplies={fetchInboxReplies}
+        inboxUrl={inboxUrl}
+        generateReplies={generateReplies}
+        campaigns={campaigns}
+        onLogPost={handleLogPost}
+        getFrequencyWarning={getPostFrequencyWarning}
+        onCountUpdate={setFollowUpCount}
+        onRengaged={handleRengaged}
+        rengageCooldownMins={rengageCooldownMins}
+        lastRengageAt={lastRengageAt}
+      />
+    ) : (
       <ResultsScreen
         colors={colors}
         campaigns={campaigns}
@@ -395,24 +416,28 @@ export default function App() {
         lastRengageAt={lastRengageAt}
       />
     );
-  } else if (tab === 'followups') {
     content = (
-      <FollowUpsScreen
-        colors={colors}
-        commentLog={commentLog}
-        username={username}
-        checkFollowUps={checkFollowUps}
-        fetchInboxReplies={fetchInboxReplies}
-        inboxUrl={inboxUrl}
-        generateReplies={generateReplies}
-        campaigns={campaigns}
-        onLogPost={handleLogPost}
-        getFrequencyWarning={getPostFrequencyWarning}
-        onCountUpdate={setFollowUpCount}
-        onRengaged={handleRengaged}
-        rengageCooldownMins={rengageCooldownMins}
-        lastRengageAt={lastRengageAt}
-      />
+      <View style={{ flex: 1 }}>
+        <View style={{ flexDirection: 'row', backgroundColor: colors.card2, marginHorizontal: 12, marginTop: 10, borderRadius: 8, padding: 3 }}>
+          {[{ k: 'results', l: 'Results' }, { k: 'followups', l: 'Follow-Ups' }].map(function (s) {
+            var active = redditView === s.k;
+            return (
+              <TouchableOpacity key={s.k} onPress={function () { setRedditView(s.k); }}
+                style={{ flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 6, backgroundColor: active ? colors.card : 'transparent' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Text style={{ color: active ? colors.text : colors.textMuted, fontSize: 13, fontWeight: active ? '700' : '500' }}>{s.l}</Text>
+                  {s.k === 'followups' && followUpCount > 0 ? (
+                    <View style={{ backgroundColor: colors.accent, borderRadius: 9, minWidth: 18, height: 18, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 }}>
+                      <Text style={{ color: '#000', fontSize: 10, fontWeight: '700' }}>{followUpCount}</Text>
+                    </View>
+                  ) : null}
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        <View style={{ flex: 1 }}>{redditScreen}</View>
+      </View>
     );
   } else if (tab === 'actions') {
     content = (
@@ -420,6 +445,8 @@ export default function App() {
         colors={colors}
         campaigns={campaigns}
         generateActionContent={generateActionContent}
+        tagCampaignAssets={tagCampaignAssets}
+        onUpdateCampaign={updateCampaign}
       />
     );
   } else if (tab === 'metrics') {
@@ -432,7 +459,7 @@ export default function App() {
         colors={colors}
         campaigns={campaigns}
         commentLog={commentLog}
-        onSelect={function () { switchSection('reddit'); }}
+        onSelect={function () { setRedditView('results'); setTab('reddit'); }}
         onEdit={handleEditCampaign}
         onDelete={handleDeleteCampaign}
         onCreate={handleCreateCampaign}
@@ -465,34 +492,17 @@ export default function App() {
     );
   }
 
-  var sectionTabs = section === 'marketing'
-    ? [
-        { key: 'actions', label: 'Actions', icon: 'checkmark-circle-outline', iconActive: 'checkmark-circle' },
-        { key: 'metrics', label: 'Metrics', icon: 'bar-chart-outline', iconActive: 'bar-chart' },
-      ]
-    : [
-        { key: 'results', label: 'Results', icon: 'search', iconActive: 'search' },
-        { key: 'followups', label: 'Follow-Ups', icon: 'chatbubble-ellipses-outline', iconActive: 'chatbubble-ellipses' },
-      ];
-  var tabItems = sectionTabs.concat([
+  var tabItems = [
     { key: 'campaigns', label: 'Campaigns', icon: 'layers-outline', iconActive: 'layers' },
+    { key: 'actions', label: 'Actions', icon: 'checkmark-circle-outline', iconActive: 'checkmark-circle' },
+    { key: 'reddit', label: 'Reddit', icon: 'logo-reddit', iconActive: 'logo-reddit' },
+    { key: 'metrics', label: 'Metrics', icon: 'bar-chart-outline', iconActive: 'bar-chart' },
     { key: 'settings', label: 'Settings', icon: 'settings-outline', iconActive: 'settings' },
-  ]);
+  ];
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: colors.bg }}>
       <StatusBar barStyle={theme.isDark ? 'light-content' : 'dark-content'} />
-      <View style={{ flexDirection: 'row', backgroundColor: colors.card2, marginHorizontal: 12, marginTop: 10, borderRadius: 8, padding: 3 }}>
-        {[{ k: 'reddit', l: 'Reddit' }, { k: 'marketing', l: 'Marketing' }].map(function (s) {
-          var active = section === s.k;
-          return (
-            <TouchableOpacity key={s.k} onPress={function () { switchSection(s.k); }}
-              style={{ flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 6, backgroundColor: active ? colors.card : 'transparent' }}>
-              <Text style={{ color: active ? colors.text : colors.textMuted, fontSize: 13, fontWeight: active ? '700' : '500' }}>{s.l}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
       <View style={{ flex: 1 }}>{content}</View>
       <View style={{
         flexDirection: 'row', backgroundColor: colors.card,
@@ -511,7 +521,7 @@ export default function App() {
                 fontSize: 10, marginTop: 3, fontWeight: active ? '600' : '400',
                 color: active ? colors.primary : colors.textMuted,
               }}>{t.label}</Text>
-              {t.key === 'followups' && followUpCount > 0 ? (
+              {t.key === 'reddit' && followUpCount > 0 ? (
                 <View style={{
                   position: 'absolute', top: 2, right: '20%',
                   backgroundColor: colors.accent, borderRadius: 9,

@@ -3,6 +3,8 @@
 // so the API key stays server-side. For now, key is stored on device.
 
 import store from './store';
+// SDK 54 moved the classic download/read API to the legacy entrypoint.
+import * as FileSystem from 'expo-file-system/legacy';
 
 let apiKey = null;
 let usageLog = { totalPromptTokens: 0, totalResponseTokens: 0, calls: 0, history: [] };
@@ -117,7 +119,9 @@ export async function callAI(prompt, systemPrompt, purpose) {
   return callGemini(prompt, systemPrompt, purpose);
 }
 
-async function callGemini(prompt, systemPrompt, purpose) {
+// extraParts lets callers attach non-text parts (e.g. an inlineData image) ahead
+// of the text prompt, for multimodal calls like image tagging.
+async function callGemini(prompt, systemPrompt, purpose, extraParts) {
   if (!apiKey) throw new Error('No API key configured');
 
   // Stay within free-tier RPM/RPD before spending a call.
@@ -129,7 +133,8 @@ async function callGemini(prompt, systemPrompt, purpose) {
     contents.push({ role: 'user', parts: [{ text: systemPrompt }] });
     contents.push({ role: 'model', parts: [{ text: 'Understood.' }] });
   }
-  contents.push({ role: 'user', parts: [{ text: prompt }] });
+  var userParts = (extraParts || []).concat(prompt ? [{ text: prompt }] : []);
+  contents.push({ role: 'user', parts: userParts });
 
   var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent?key=' + apiKey;
   var reqBody = JSON.stringify({ contents: contents });
@@ -227,7 +232,10 @@ export async function generateReplies(post, campaignContext) {
     'Body: ' + (post.selftext || '(no body)');
 
   var raw = await callGemini(prompt, sys, 'reply-draft');
-  return extractJSON(raw);
+  var replies = extractJSON(raw);
+  return Array.isArray(replies) ? replies.map(function (r) {
+    return { text: stripDashes(r.text), approach: r.approach, recommended: r.recommended };
+  }) : replies;
 }
 
 // ── AI relevance scoring (pass 2) ──
@@ -262,11 +270,13 @@ export async function generateBoost(campaign, existing, situation) {
     + '\n\n' + paidLine;
   var raw = await callGemini(prompt, BOOST_SYSTEM, 'boost');
   var arr = extractJSON(raw);
-  return Array.isArray(arr) ? arr : [];
+  return Array.isArray(arr) ? arr.map(function (s) {
+    return Object.assign({}, s, { title: stripDashes(s.title), rationale: stripDashes(s.rationale) });
+  }) : [];
 }
 
 // ── Per-action content (generated lazily when the user opens an item) ──
-var CONTENT_SYSTEM = 'You write ready-to-post marketing content. Given a product context and one action (its platform and title), write the content for that platform in the founder\'s authentic voice, matching the platform\'s format and conventions. Be genuine, never generic or salesy. Never use em dashes.\n\nReturn JSON: {"body":"the main text, ready to post","fields":[{"label":"...","value":"..."}]} where fields holds every extra platform-specific piece the user needs (for example: hashtags, tagline, subject line, article title, topics, video concept, suggested image description). Include everything that platform requires so the user can copy and paste it all. Output ONLY the JSON object.';
+var CONTENT_SYSTEM = 'You write ready-to-post marketing content. Given a product context and one action (its platform and title), write the content for that platform in the founder\'s authentic voice, matching the platform\'s format and conventions. Be genuine, never generic or salesy. NEVER use em dashes or en dashes anywhere; they are the clearest tell that text is AI-written. Use commas, periods, or separate sentences instead.\n\nVISUAL: most social and listing actions need an image or video. The user may have a set of finished App Store gallery images (polished marketing cards with a headline, subtitle, and the app shown in a device frame, already composited and ready to post). You will be told how many they have. Always provide a top-level "visual" string telling the user exactly what to attach:\n- If one of the numbered gallery images fits, say so and set "imageIndex" to that image\'s number, and note any crop needed for this platform\'s aspect ratio (App Store cards are tall portrait; square for Instagram, landscape for X, etc.).\n- If no gallery image fits (for example TikTok or Reels needs a raw screen recording, or the action needs a candid or demo clip), set "imageIndex" to null and give a precise capture brief: what to record or shoot, length, orientation, and what to show.\nBecause gallery cards already have a headline and subtitle baked into the image, write the post text to COMPLEMENT that on-image text, never to repeat it. The gallery is a small fixed set (often under ten), so for RECURRING social posts do NOT keep reusing the same cards: prefer a fresh lightweight visual that varies by post (a short screen recording, a single-feature spotlight, a tip or quote card, a poll, or a text-only post), and reserve the polished gallery cards for launches and occasional reuse.\n\nReturn JSON: {"body":"the main text, ready to post","visual":"exactly what image or video to attach, and why","imageIndex": the 1-based number of the recommended gallery image, or null if a capture is needed or none fits,"fields":[{"label":"...","value":"..."}]}. fields holds the remaining platform extras the user copies (for example: hashtags, tagline, subject line, article title, topics). Output ONLY the JSON object.';
 
 // Object-only JSON extraction (extractJSON grabs the first array, which breaks
 // objects that contain a "fields" array).
@@ -280,24 +290,132 @@ function extractJSONObject(text) {
   throw new Error('No JSON object found in AI response');
 }
 
+// Em dashes are the clearest "this was AI" tell, so we never ship them in any
+// generated content. The prompt asks the model to avoid them, but models slip,
+// so this guarantees it: em dash becomes a comma, en dash becomes a hyphen.
+export function stripDashes(str) {
+  if (typeof str !== 'string') return str;
+  return str
+    .replace(/\s*—\s*/g, ', ') // em dash -> comma in prose
+    .replace(/–/g, '-')         // en dash -> hyphen (ranges)
+    .replace(/ ,/g, ',')
+    .replace(/,\s*,/g, ', ')
+    .replace(/,\s*\./g, '.')
+    .replace(/  +/g, ' ');
+}
+
+function sanitizeContent(c) {
+  return {
+    body: stripDashes(c.body || ''),
+    fields: (c.fields || []).map(function (f) { return { label: f.label, value: stripDashes(f.value) }; }),
+  };
+}
+
+// ── Post history (anti-repetition for recurring social) ──
+// We keep a short rolling log of what was written per campaign + platform so the
+// next recurring post can be told "do not repeat these angles."
+function postLogKey(id) { return 'rengage-postlog-' + id; }
+async function loadPostLog(id) { return (await store.get(postLogKey(id))) || []; }
+async function appendPost(id, platform, body) {
+  if (!id || !body) return;
+  var log = await loadPostLog(id);
+  log.push({ platform: platform, body: String(body).slice(0, 400), at: Date.now() });
+  if (log.length > 30) log = log.slice(-30);
+  await store.set(postLogKey(id), log);
+}
+
+// ── Vision tagging of App Store gallery images (one-time, on demand) ──
+function guessMime(url) { return /\.png(\?|$)/i.test(url || '') ? 'image/png' : 'image/jpeg'; }
+async function imageToBase64(url) {
+  var path = FileSystem.cacheDirectory + 'tag-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.img';
+  var dl = await FileSystem.downloadAsync(url, path);
+  var b64 = await FileSystem.readAsStringAsync(dl.uri, { encoding: FileSystem.EncodingType.Base64 });
+  FileSystem.deleteAsync(dl.uri, { idempotent: true }).catch(function () {});
+  return b64;
+}
+var TAG_SYSTEM = 'You are analyzing ONE App Store marketing screenshot. It is a polished card: a headline, often a subtitle, and the app shown inside a device frame. Return JSON {"headline":"the exact main headline text shown on the image","shows":"what app feature or screen the image depicts, in a few words","bestFor":"a short comma-separated list of platforms or post types this image suits"}. Output ONLY the JSON object.';
+
+// Returns a NEW assets object with a tags map { url: {headline, shows, bestFor} }.
+// Skips images already tagged. Throttled by the normal RPM governor.
+export async function tagCampaignAssets(campaign) {
+  var a = (campaign && campaign.assets) || {};
+  var urls = (a.iphone || []).slice(0, 8); // cap calls; iPhone gallery is the useful set
+  var tags = Object.assign({}, a.tags || {});
+  for (var i = 0; i < urls.length; i++) {
+    var url = urls[i];
+    if (tags[url]) continue;
+    try {
+      var b64 = await imageToBase64(url);
+      var raw = await callGemini('Describe this App Store marketing image.', TAG_SYSTEM, 'asset-tag',
+        [{ inlineData: { mimeType: guessMime(url), data: b64 } }]);
+      var obj = extractJSONObject(raw);
+      tags[url] = {
+        headline: stripDashes(obj.headline || ''),
+        shows: stripDashes(obj.shows || ''),
+        bestFor: stripDashes(obj.bestFor || ''),
+      };
+    } catch (e) { /* skip this image, keep going */ }
+  }
+  return Object.assign({}, a, { tags: tags });
+}
+
 export async function generateActionContent(campaign, item) {
   var ctx = (campaign.context || '').slice(0, 3000);
+  var assets = campaign.assets || {};
+  var tags = assets.tags || {};
+  var taggedUrls = Object.keys(tags);
+  var shotCount = (assets.iphone || []).length + (assets.ipad || []).length;
+
+  var visualLine;
+  if (taggedUrls.length) {
+    visualLine = '\n\nYour App Store gallery images (polished marketing cards). Pick the ONE whose content best fits this action, set imageIndex to its number, and never repeat its headline in your caption:\n'
+      + taggedUrls.map(function (u, i) {
+          var t = tags[u];
+          return (i + 1) + '. headline "' + t.headline + '", shows ' + t.shows + (t.bestFor ? ', good for ' + t.bestFor : '');
+        }).join('\n')
+      + '\nIf none fits (for example a video is needed), give a capture brief instead.';
+  } else if (shotCount > 0) {
+    visualLine = '\n\nThe user has ' + shotCount + ' finished App Store gallery images (polished marketing cards with headline + subtitle + app in a device frame). Reference these in the Visual field where they fit; otherwise give a capture brief.';
+  } else {
+    visualLine = '\n\nThe user has no ready-made gallery images, so the Visual field should be a capture brief: what image or video to create.';
+  }
+
+  var recentLine = '';
+  if (item.type === 'recurring' && campaign.id) {
+    var log = await loadPostLog(campaign.id);
+    var recent = log.filter(function (p) { return p.platform === item.platform; }).slice(-4);
+    if (recent.length) {
+      recentLine = '\n\nYou have already written these recent ' + item.platform + ' posts. Write something genuinely DIFFERENT: a new angle, hook, and opening line. Do NOT reuse them:\n'
+        + recent.map(function (p, i) { return (i + 1) + '. ' + p.body; }).join('\n');
+    }
+  }
+
   var prompt = 'Platform: ' + item.platform + '\nAction: ' + item.title
     + '\n\nProduct context:\n' + ctx
+    + visualLine
+    + recentLine
     + (campaign.toneExamples ? '\n\nFounder tone examples (match this voice):\n' + campaign.toneExamples.slice(0, 800) : '');
   var raw = await callGemini(prompt, CONTENT_SYSTEM, 'action-content');
   var obj = extractJSONObject(raw);
-  if (obj && (typeof obj.body === 'string' || Array.isArray(obj.fields))) {
-    return { body: obj.body || '', fields: Array.isArray(obj.fields) ? obj.fields : [] };
+
+  var result;
+  if (obj && (typeof obj.body === 'string' || Array.isArray(obj.fields) || typeof obj.visual === 'string')) {
+    result = sanitizeContent({ body: obj.body || '', fields: Array.isArray(obj.fields) ? obj.fields : [] });
+  } else {
+    // Fallback: model returned platform-specific top-level keys — render as fields.
+    var fields = Object.keys(obj || {}).filter(function (k) { return k !== 'visual' && k !== 'imageIndex'; }).map(function (k) {
+      var v = obj[k];
+      if (Array.isArray(v)) v = v.join(', ');
+      else if (v && typeof v === 'object') v = JSON.stringify(v);
+      return { label: k, value: String(v) };
+    });
+    result = sanitizeContent({ body: '', fields: fields });
   }
-  // Fallback: model returned platform-specific top-level keys — render as fields.
-  var fields = Object.keys(obj || {}).map(function (k) {
-    var v = obj[k];
-    if (Array.isArray(v)) v = v.join(', ');
-    else if (v && typeof v === 'object') v = JSON.stringify(v);
-    return { label: k, value: String(v) };
-  });
-  return { body: '', fields: fields };
+  result.visual = stripDashes((obj && obj.visual) || '');
+  result.imageIndex = (obj && typeof obj.imageIndex === 'number' && obj.imageIndex > 0) ? obj.imageIndex : null;
+
+  if (item.type === 'recurring') appendPost(campaign.id, item.platform, result.body);
+  return result;
 }
 
 export async function aiScorePosts(posts, campaignContext) {

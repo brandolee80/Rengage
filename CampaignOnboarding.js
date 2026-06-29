@@ -57,6 +57,7 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
   var [kwText, setKwText] = useState(isEdit ? (existingCampaign.keywords || []).join(', ') : '');
   var [asoText, setAsoText] = useState(isEdit ? (existingCampaign.asoKeywords || []).join(', ') : '');
   var [appStoreId, setAppStoreId] = useState(isEdit ? (existingCampaign.appStoreId || '') : '');
+  var [assets, setAssets] = useState(isEdit ? (existingCampaign.assets || null) : null);
   var [playPackage, setPlayPackage] = useState(isEdit ? (existingCampaign.playPackage || '') : '');
   var [toneExamples, setToneExamples] = useState(isEdit ? (existingCampaign.toneExamples || '') : '');
   var [includePaid, setIncludePaid] = useState(isEdit ? !!existingCampaign.includePaid : false);
@@ -235,6 +236,7 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
       if (appLink && !isPlayLink(appLink)) {
         var listing = await fetchAppStoreListing(appLink);
         if (listing.appStoreId) setAppStoreId(listing.appStoreId);
+        if (listing.assets && (listing.assets.iphone.length || listing.assets.ipad.length)) setAssets(listing.assets);
         if (!name.trim() && listing.name) setName(listing.name);
         text = (listing.name ? listing.name + '\n' : '') + listing.description
           + (listing.price ? '\nPrice: ' + listing.price : '')
@@ -377,6 +379,7 @@ export default function CampaignOnboarding({ colors, onSave, onCancel, existingC
       keywords: parseList(kwText),
       asoKeywords: parseList(asoText),
       appStoreId: appStoreId.trim(),
+      assets: assets,
       playPackage: playPackage.trim(),
       toneExamples: toneExamples,
       includePaid: includePaid,

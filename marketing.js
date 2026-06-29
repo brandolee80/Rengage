@@ -41,6 +41,13 @@ export async function fetchAppStoreListing(url) {
     price: a.formattedPrice || '',
     seller: a.sellerName || '',
     url: a.trackViewUrl || url,
+    // Finished marketing assets (headline + frame already composited), ready to
+    // post as-is. iPhone gallery, iPad gallery, and the app icon.
+    assets: {
+      iphone: a.screenshotUrls || [],
+      ipad: a.ipadScreenshotUrls || [],
+      icon: a.artworkUrl512 || a.artworkUrl100 || '',
+    },
   };
 }
 

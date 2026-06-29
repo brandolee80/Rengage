@@ -28,7 +28,15 @@
       "package": "com.sheffco.rengage"
     },
     "plugins": [
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Rengage imports screenshots you take of your app so it can suggest them as social media visuals.",
+          "savePhotosPermission": "Rengage saves marketing images to your photo library.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ]
     ],
     "extra": {
       "eas": {
